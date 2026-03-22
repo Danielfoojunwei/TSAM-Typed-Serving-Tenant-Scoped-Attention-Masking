@@ -37,6 +37,24 @@ class TestMutualInformationEstimator:
         mi, std = mi_est.estimate_bits(x, y)
         assert mi == 0.0  # Too few samples.
 
+    def test_estimate_nats_non_negative(self):
+        """MI estimate in nats should be non-negative."""
+        rng = np.random.default_rng(42)
+        x = rng.normal(0, 1, (100, 2))
+        y = rng.normal(0, 1, (100, 2))
+        mi_est = MutualInformationEstimator(k=3)
+        mi_nats, _ = mi_est.estimate(x, y)
+        assert mi_nats >= 0.0
+
+    def test_bootstrap_std_returned(self):
+        """Verify bootstrap standard deviation is computed and non-negative."""
+        rng = np.random.default_rng(42)
+        x = rng.normal(0, 1, (100, 3))
+        y = x + rng.normal(0, 0.5, (100, 3))
+        mi_est = MutualInformationEstimator(k=3)
+        mi, std = mi_est.estimate_bits(x, y)
+        assert std >= 0.0
+
 
 class TestLeakageEstimator:
     def test_perfect_reconstruction(self):
@@ -66,6 +84,69 @@ class TestLeakageEstimator:
         est = LeakageEstimator()
         bits = est.measure_reconstruction_leakage(np.array([]), np.array([]))
         assert bits == 0.0
+
+    def test_measure_output_leakage_independent(self):
+        """MI-based leakage between independent outputs and private content should be low."""
+        rng = np.random.default_rng(42)
+        outputs = rng.normal(0, 1, (50, 10))
+        private = rng.normal(0, 1, (50, 10))
+        est = LeakageEstimator()
+        mi_bits, mi_std = est.measure_output_leakage(outputs, private)
+        assert mi_bits < 1.0, f"Independent output/private MI should be low, got {mi_bits}"
+
+    def test_measure_output_leakage_correlated(self):
+        """MI-based leakage between correlated outputs and private content should be high."""
+        rng = np.random.default_rng(42)
+        # Use enough samples and sufficient dimensionality for KSG to detect correlation.
+        private = rng.normal(0, 1, (500, 3))
+        outputs = private + rng.normal(0, 0.1, (500, 3))  # Strong correlation.
+        est = LeakageEstimator()
+        mi_bits, mi_std = est.measure_output_leakage(outputs, private)
+        assert mi_bits > 0.5, f"Correlated output/private MI should be high, got {mi_bits}"
+
+    def test_run_leakage_experiment_zero_leakage(self):
+        """End-to-end experiment where attacker never reconstructs correctly."""
+        rng = np.random.default_rng(42)
+        private_tokens = np.array([100, 200, 300, 400, 500])
+
+        def attack_fn(q_idx):
+            # Attacker always guesses wrong tokens and produces random embeddings.
+            wrong_tokens = np.array([0, 0, 0, 0, 0])
+            random_embedding = rng.normal(0, 1, 5)
+            return wrong_tokens, random_embedding
+
+        est = LeakageEstimator(vocab_size=32000)
+        result = est.run_leakage_experiment(
+            attack_fn=attack_fn,
+            private_prompt_tokens=private_tokens,
+            num_attack_queries=20,
+            defense_name="test_defense",
+        )
+
+        assert isinstance(result, LeakageResult)
+        assert result.bits_per_query == 0.0
+        assert result.reconstruction_rate == 0.0
+        assert result.num_queries == 20
+        assert result.defense == "test_defense"
+
+    def test_run_leakage_experiment_perfect_leakage(self):
+        """End-to-end experiment where attacker perfectly reconstructs."""
+        private_tokens = np.array([100, 200, 300])
+
+        def attack_fn(q_idx):
+            return private_tokens.copy(), private_tokens.astype(np.float64)
+
+        est = LeakageEstimator(vocab_size=32000)
+        result = est.run_leakage_experiment(
+            attack_fn=attack_fn,
+            private_prompt_tokens=private_tokens,
+            num_attack_queries=10,
+            defense_name="no_defense",
+        )
+
+        expected_bits_per_query = np.log2(32000) * 3
+        assert abs(result.bits_per_query - expected_bits_per_query) < 0.01
+        assert result.reconstruction_rate == 1.0
 
 
 class TestCollisionAttack:
@@ -112,3 +193,56 @@ class TestCollisionAttack:
             no_defense, defended
         )
         assert reduction >= 90.0  # 0.04/0.8 = 5% remaining = 95% reduction.
+
+    def test_calibrate_threshold(self):
+        """Verify threshold calibration produces a value between hit and miss means."""
+        from tsam.evaluation.collision_attack import CollisionAttackSimulator
+
+        rng = np.random.default_rng(42)
+
+        def oracle(prompt: str, tenant: int) -> float:
+            if prompt == "hit":
+                return max(1.0, rng.normal(30.0, 5.0))
+            return max(1.0, rng.normal(80.0, 10.0))
+
+        sim = CollisionAttackSimulator(timing_oracle=oracle, num_calibration_probes=20)
+        threshold = sim.calibrate_threshold("hit", "miss", tenant_id=0)
+        assert 20.0 < threshold < 100.0, f"Threshold {threshold} out of expected range"
+
+    def test_run_attack_end_to_end(self):
+        """Full attack: calibrate, probe, measure bits."""
+        from tsam.evaluation.collision_attack import CollisionAttackSimulator
+
+        rng = np.random.default_rng(42)
+        cached = set(range(50))
+
+        def oracle(prompt: str, tenant: int) -> float:
+            idx = int(prompt)
+            if idx in cached:
+                return max(1.0, rng.normal(30.0, 5.0))
+            return max(1.0, rng.normal(80.0, 10.0))
+
+        sim = CollisionAttackSimulator(timing_oracle=oracle, num_calibration_probes=30)
+        sim.calibrate_threshold("0", "99", tenant_id=0)
+
+        probes = [str(i) for i in range(100)]
+        truth = [i in cached for i in range(100)]
+
+        result = sim.run_attack(probes, truth, attacker_tenant_id=0, defense_name="no_defense")
+
+        assert result.num_probes == 100
+        assert result.detection_accuracy > 0.8, (
+            f"Attack accuracy {result.detection_accuracy} too low for clear timing gap"
+        )
+        assert result.bits_per_query > 0.0
+        assert result.defense == "no_defense"
+
+    def test_run_attack_requires_calibration(self):
+        """Attack should raise if threshold not calibrated."""
+        from tsam.evaluation.collision_attack import CollisionAttackSimulator
+
+        sim = CollisionAttackSimulator(
+            timing_oracle=lambda p, t: 50.0, num_calibration_probes=10
+        )
+        with pytest.raises(ValueError, match="Threshold not calibrated"):
+            sim.run_attack(["a"], [True], attacker_tenant_id=0)

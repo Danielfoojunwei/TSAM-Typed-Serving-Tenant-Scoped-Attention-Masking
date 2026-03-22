@@ -43,6 +43,19 @@ class TestTypedBlockManager:
         bm.free(pages[0].block_id)
         assert bm.num_free_blocks == 8
 
+    def test_free_resets_metadata(self):
+        """Verify that freeing a block resets page_type and tenant_id tensors."""
+        bm = TypedBlockManager(num_blocks=10)
+        pages = bm.allocate_private(tenant=42, count=1)
+        blk = pages[0].block_id
+        assert bm.page_type[blk].item() == PageType.PRIVATE
+        assert bm.tenant_id[blk].item() == 42
+
+        bm.free(blk)
+        # After free, metadata must be reset.
+        assert bm.page_type[blk].item() == 0  # Default (PRIVATE enum value, but unallocated)
+        assert bm.tenant_id[blk].item() == SHARED_TENANT_ID
+
     def test_free_tenant(self):
         bm = TypedBlockManager(num_blocks=100)
         bm.allocate_private(tenant=0, count=5)
@@ -50,6 +63,15 @@ class TestTypedBlockManager:
         freed = bm.free_tenant(0)
         assert freed == 5
         assert bm.num_free_blocks == 100 - 3
+
+    def test_free_tenant_does_not_free_shared(self):
+        """free_tenant should only free PRIVATE blocks, not SHARED."""
+        bm = TypedBlockManager(num_blocks=20)
+        bm.allocate_shared(count=2)
+        bm.allocate_private(tenant=0, count=3)
+        bm.free_tenant(0)
+        # 2 shared blocks should still be allocated.
+        assert bm.num_free_blocks == 20 - 2
 
     def test_free_nonexistent_raises(self):
         bm = TypedBlockManager(num_blocks=10)
@@ -62,11 +84,67 @@ class TestTypedBlockManager:
         with pytest.raises(RuntimeError, match="Cannot allocate"):
             bm.allocate_private(tenant=1, count=1)
 
+    def test_block_reuse_after_free(self):
+        """Freed blocks should be reusable for new allocations."""
+        bm = TypedBlockManager(num_blocks=5)
+        pages = bm.allocate_private(tenant=0, count=5)
+        assert bm.num_free_blocks == 0
+
+        # Free all.
+        for p in pages:
+            bm.free(p.block_id)
+        assert bm.num_free_blocks == 5
+
+        # Re-allocate for different tenant.
+        new_pages = bm.allocate_private(tenant=1, count=5)
+        assert bm.num_free_blocks == 0
+        for p in new_pages:
+            assert p.tenant_id == 1
+            assert bm.page_type[p.block_id].item() == PageType.PRIVATE
+            assert bm.tenant_id[p.block_id].item() == 1
+
+    def test_block_reuse_isolation_correct(self):
+        """After block reuse, masks must reflect new ownership, not old."""
+        bm = TypedBlockManager(num_blocks=10)
+        old = bm.allocate_private(tenant=0, count=3)
+        old_ids = [p.block_id for p in old]
+
+        # Free tenant 0's blocks.
+        for p in old:
+            bm.free(p.block_id)
+
+        # Re-allocate for tenant 1.
+        new = bm.allocate_private(tenant=1, count=3)
+
+        # The reused blocks should now belong to tenant 1.
+        mask_t0 = bm.build_access_mask(query_tenant=0)
+        mask_t1 = bm.build_access_mask(query_tenant=1)
+
+        for p in new:
+            assert mask_t1[p.block_id].item() is True
+            assert mask_t0[p.block_id].item() is False
+
     def test_get_tenant_blocks(self):
         bm = TypedBlockManager(num_blocks=100)
         pages = bm.allocate_private(tenant=7, count=4)
         blocks = bm.get_tenant_blocks(7)
         assert blocks == {p.block_id for p in pages}
+
+    def test_get_tenant_blocks_empty(self):
+        bm = TypedBlockManager(num_blocks=10)
+        blocks = bm.get_tenant_blocks(999)
+        assert blocks == set()
+
+    def test_get_page_returns_none_for_unallocated(self):
+        bm = TypedBlockManager(num_blocks=10)
+        assert bm.get_page(0) is None
+
+    def test_get_page_returns_page_for_allocated(self):
+        bm = TypedBlockManager(num_blocks=10)
+        pages = bm.allocate_private(tenant=0, count=1)
+        page = bm.get_page(pages[0].block_id)
+        assert page is not None
+        assert page.tenant_id == 0
 
     def test_build_access_mask_private(self):
         bm = TypedBlockManager(num_blocks=10)
@@ -100,6 +178,12 @@ class TestTypedBlockManager:
         assert bm.get_page(blk) is not None
         bm.unref_shared(blk)  # refcount 0 -> freed
         assert bm.get_page(blk) is None
+
+    def test_ref_nonshared_raises(self):
+        bm = TypedBlockManager(num_blocks=10)
+        bm.allocate_private(tenant=0, count=1)
+        with pytest.raises(ValueError, match="not a SHARED block"):
+            bm.ref_shared(0)
 
     def test_multiple_tenants_isolation(self):
         bm = TypedBlockManager(num_blocks=1000)
