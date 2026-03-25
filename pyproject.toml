@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tsam"
+version = "0.1.0"
+description = "TSAM: Typed Serving — Tenant-Scoped Attention Masking for Multi-Tenant LLM Serving"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-xdist",
+]
+triton = [
+    "triton>=2.3.0",
+]
+eval = [
+    "pandas",
+    "matplotlib",
+]
+vllm = [
+    "vllm>=0.4.0",
+]
+all = [
+    "tsam[dev,triton,eval,vllm]",
+]
+
+[tool.setuptools.packages.find]
+include = ["tsam*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short"
