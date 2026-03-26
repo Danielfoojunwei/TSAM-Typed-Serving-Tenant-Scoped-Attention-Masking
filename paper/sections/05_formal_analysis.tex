@@ -1,0 +1,375 @@
+% =============================================================================
+% Section 5: Formal Analysis
+% =============================================================================
+
+\section{Formal Analysis}
+\label{sec:formal}
+
+We now establish the theoretical foundations of TSAM, proving that typed page metadata
+combined with attention masking provides \emph{perfect} tenant isolation---a guarantee
+strictly stronger than differential privacy or statistical indistinguishability.
+
+% -----------------------------------------------------------------------------
+\subsection{Notation and Setup}
+\label{sec:formal:notation}
+
+Let $\mathcal{T} = \{t_1, t_2, \ldots, t_N\}$ denote the set of tenants concurrently
+served within a single inference batch. Each \emph{typed page} is a tuple
+$p = (\texttt{block\_id}, \tau, \rho, A)$, where:
+\begin{itemize}[leftmargin=1.5em,itemsep=2pt]
+    \item $\texttt{block\_id} \in \mathbb{N}$ is the unique physical page identifier in
+          the KV cache;
+    \item $\tau \in \{\textsc{System}, \textsc{Shared}, \textsc{Private}\}$ is the
+          \emph{page type}, assigned at allocation time;
+    \item $\rho \in \mathcal{T} \cup \{\bot\}$ is the \emph{owner field}, with
+          $\rho = \bot$ for shared and system pages;
+    \item $A \subseteq \mathcal{T}$ is the \emph{access set}, specifying which tenants
+          may attend to this page.
+\end{itemize}
+
+\noindent
+The following \textbf{type invariants} hold by construction:
+\begin{align}
+    \tau = \textsc{Shared}  &\implies \rho = \bot \;\wedge\; A = \mathcal{T}, \label{eq:inv-shared}\\
+    \tau = \textsc{Private} &\implies \rho = t_i \;\wedge\; A = \{t_i\}. \label{eq:inv-private}
+\end{align}
+
+For a given tenant $t_i$, we define the \textbf{TSAM attention mask} $M_{t_i} \in \{0,1\}^L$
+over the $L$ positions in the KV cache as:
+\begin{equation}
+    M_{t_i}[j] = \begin{cases}
+        1 & \text{if } t_i \in A(p_j), \\
+        0 & \text{otherwise},
+    \end{cases}
+    \label{eq:mask}
+\end{equation}
+where $p_j$ is the typed page containing position $j$, and $A(p_j)$ is its access set.
+
+This induces a natural \textbf{three-way partition} of the KV positions for tenant $t_i$:
+\begin{align}
+    S      &= \{j : \tau(p_j) = \textsc{Shared}\},   && \text{(shared prefix)} \\
+    O_i    &= \{j : \tau(p_j) = \textsc{Private} \wedge \rho(p_j) = t_i\}, && \text{(own private)} \\
+    X_i    &= \{j : \tau(p_j) = \textsc{Private} \wedge \rho(p_j) \neq t_i\}. && \text{(cross-tenant private)}
+\end{align}
+By construction, $S \cup O_i \cup X_i = \{1, \ldots, L\}$ and the sets are pairwise disjoint.
+From Equations~\eqref{eq:inv-shared}--\eqref{eq:mask}, we have $M_{t_i}[j] = 1$ for
+$j \in S \cup O_i$ and $M_{t_i}[j] = 0$ for $j \in X_i$.
+
+% -----------------------------------------------------------------------------
+\subsection{Information-Theoretic Isolation Guarantee}
+\label{sec:formal:isolation}
+
+We establish perfect tenant isolation through a sequence of three results, each building
+on the previous.
+
+\begin{lemma}[Zero Attention Weight]
+\label{lem:zero-weight}
+For any tenant $t_i$ and any KV position $j \in X_i$, the attention weight
+$w_{t_i}[j] = 0$ exactly.
+\end{lemma}
+
+\begin{proof}
+The masked attention score at position $j$ is computed as:
+\begin{equation}
+    s_{t_i}[j] = \begin{cases}
+        q_{t_i}^\top k_j / \sqrt{d_k} & \text{if } M_{t_i}[j] = 1, \\
+        -\infty & \text{if } M_{t_i}[j] = 0.
+    \end{cases}
+\end{equation}
+For $j \in X_i$, we have $M_{t_i}[j] = 0$, so $s_{t_i}[j] = -\infty$.
+The softmax weight is:
+\begin{equation}
+    w_{t_i}[j] = \frac{\exp(s_{t_i}[j])}{Z} = \frac{\exp(-\infty)}{Z} = \frac{0}{Z} = 0,
+\end{equation}
+where $Z = \sum_{\ell=1}^{L} \exp(s_{t_i}[\ell]) > 0$ since at least one position
+in $S \cup O_i$ has a finite score.
+
+\medskip
+\noindent\textbf{IEEE 754 exactness.}
+Under IEEE 754 double-precision arithmetic, the mask value $-\infty$ is represented as
+\texttt{-inf}, and $\exp(\texttt{-inf}) = +0$ \emph{exactly} (IEEE 754 \S6.1), not merely
+a subnormal approximation. Division of exact zero by any finite positive $Z$ yields exact
+zero. No rounding, underflow, or denormalization occurs---the zero is \emph{bitwise exact}.
+In FlashAttention~\cite{dao2022flashattention}, the equivalent operation sets the
+pre-softmax logit to \texttt{-inf} within each tile, producing the same exact zero
+after the online softmax rescaling.
+\end{proof}
+
+\begin{lemma}[Functional Independence]
+\label{lem:functional-independence}
+Let $q$ be a query vector for tenant $t_i$, and let $K, V$ denote the full KV cache.
+The attention output is a function only of the query and the visible KV pairs:
+\begin{equation}
+    \mathrm{Attn}_{t_i}(q, K, V) = f\!\big(q,\; \{(k_j, v_j)\}_{j \in S \cup O_i}\big).
+\end{equation}
+In particular, the output does not depend on any $(k_j, v_j)$ for $j \in X_i$.
+\end{lemma}
+
+\begin{proof}
+The attention output for tenant $t_i$ decomposes as:
+\begin{equation}
+    \mathrm{Attn}_{t_i}(q, K, V) = \sum_{j=1}^{L} w_{t_i}[j] \cdot v_j
+    = \underbrace{\sum_{j \in S \cup O_i} w_{t_i}[j] \cdot v_j}_{\text{visible contribution}}
+    + \underbrace{\sum_{j \in X_i} w_{t_i}[j] \cdot v_j}_{\text{cross-tenant contribution}}.
+\end{equation}
+By Lemma~\ref{lem:zero-weight}, $w_{t_i}[j] = 0$ for all $j \in X_i$, so the
+cross-tenant contribution vanishes identically:
+\begin{equation}
+    \sum_{j \in X_i} w_{t_i}[j] \cdot v_j = \sum_{j \in X_i} 0 \cdot v_j = \mathbf{0}.
+\end{equation}
+Furthermore, the normalization constant $Z$ also excludes cross-tenant positions:
+\begin{equation}
+    Z = \sum_{\ell=1}^{L} \exp(s_{t_i}[\ell])
+      = \sum_{\ell \in S \cup O_i} \exp(s_{t_i}[\ell])
+      + \sum_{\ell \in X_i} \underbrace{\exp(-\infty)}_{=\;0} = \sum_{\ell \in S \cup O_i} \exp(s_{t_i}[\ell]).
+\end{equation}
+Therefore, the weights $w_{t_i}[j]$ for $j \in S \cup O_i$ depend only on
+$\{q, k_j : j \in S \cup O_i\}$, and the full output depends only on
+$\{q, (k_j, v_j) : j \in S \cup O_i\}$.
+\end{proof}
+
+\begin{theorem}[Perfect Tenant Isolation]
+\label{thm:isolation}
+For any two distinct tenants $t_i, t_j \in \mathcal{T}$ with $i \neq j$, the mutual
+information between tenant $t_i$'s attention output and tenant $t_j$'s private KV data
+is exactly zero:
+\begin{equation}
+    I\!\big(\mathrm{Attn}_{t_i}(q, K, V);\; \mathrm{KV}_{\mathrm{private}}(t_j)\big) = 0.
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+Define the following random variables:
+\begin{align}
+    A &\triangleq \mathrm{Attn}_{t_i}(q, K, V), &&\text{(tenant $t_i$'s attention output)} \\
+    B &\triangleq \mathrm{KV}_{\mathrm{private}}(t_j) = \{(k_\ell, v_\ell)\}_{\ell \in O_j}, &&\text{(tenant $t_j$'s private KV pairs)} \\
+    C &\triangleq \big(q,\; \{(k_\ell, v_\ell)\}_{\ell \in S \cup O_i}\big). &&\text{(tenant $t_i$'s visible context)}
+\end{align}
+Note that $O_j \subseteq X_i$ for $j \neq i$, so $B$ consists entirely of cross-tenant data.
+
+\medskip
+\noindent\textbf{Step 1: $A$ is a deterministic function of $C$.}
+By Lemma~\ref{lem:functional-independence}, $A = f(C)$ for a deterministic function $f$.
+This is a \emph{functional} relationship, not merely a statistical one.
+
+\medskip
+\noindent\textbf{Step 2: Conditional independence $A \perp\!\!\!\perp B \mid C$.}
+Since $A = f(C)$ is completely determined by $C$, we have:
+\begin{equation}
+    P(A \mid C, B) = P(A \mid C) = \mathbf{1}_{A = f(C)},
+\end{equation}
+which is the definition of conditional independence $A \perp\!\!\!\perp B \mid C$.
+The conditional mutual information satisfies:
+\begin{equation}
+    I(A; B \mid C) = H(A \mid C) - H(A \mid C, B) = 0 - 0 = 0,
+    \label{eq:cond-mi-zero}
+\end{equation}
+since $A$ is deterministic given $C$.
+
+\medskip
+\noindent\textbf{Step 3: Statistical independence $C \perp\!\!\!\perp B$.}
+In a multi-tenant serving scenario, each tenant's private input is generated independently:
+tenant $t_j$'s private prompt (and hence KV pairs) is statistically independent of
+tenant $t_i$'s private prompt and the shared prefix content, which together determine $C$.
+Therefore:
+\begin{equation}
+    I(C; B) = 0.
+    \label{eq:input-independence}
+\end{equation}
+
+\medskip
+\noindent\textbf{Step 4: Contraction to zero.}
+By the chain rule of mutual information~\cite{cover2006elements, shannon1948mathematical}:
+\begin{equation}
+    I(A; B) \leq I(A; B \mid C) + I(C; B).
+\end{equation}
+Substituting Equations~\eqref{eq:cond-mi-zero} and~\eqref{eq:input-independence}:
+\begin{equation}
+    I(A; B) \leq 0 + 0 = 0.
+\end{equation}
+Since mutual information is non-negative by definition~\cite{kraskov2004estimating}, we
+conclude $I(A; B) = 0$, completing the proof.
+\end{proof}
+
+\begin{remark}[Comparison with Differential Privacy]
+\label{rem:dp-comparison}
+Theorem~\ref{thm:isolation} establishes \emph{exact} zero mutual information, which is
+strictly stronger than $(\varepsilon, \delta)$-differential privacy for any
+$\varepsilon > 0$, $\delta > 0$. Under differential privacy, an adversary retains
+$\varepsilon$ nats of leakage per query, requiring careful privacy budget accounting
+across interactions. TSAM's guarantee holds \emph{per query}, requires no privacy budget,
+admits no degradation over time, and introduces no noise into the model output. This
+corresponds to \emph{perfect secrecy} in the sense of Goguen and Meseguer's
+non-interference~\cite{goguen1982security}: tenant $t_j$'s private inputs have
+\emph{literally no effect} on tenant $t_i$'s outputs.
+\end{remark}
+
+\begin{remark}[Multi-Layer Extension]
+\label{rem:multilayer}
+For a transformer with $\mathcal{L}$ layers, the isolation guarantee extends by induction.
+\textbf{Base case:} At layer $\ell = 1$, the KV cache entries are computed from embeddings
+of each tenant's own tokens (private) or the shared prefix (shared); TSAM masking yields
+$I(A^{(1)}_{t_i}; B) = 0$ by Theorem~\ref{thm:isolation}. \textbf{Inductive step:}
+At layer $\ell + 1$, the input to attention is the output of layer $\ell$, which by the
+inductive hypothesis depends only on $t_i$'s visible context. The typed page metadata is
+preserved across layers (it is a property of the physical page, not the layer), so the
+TSAM mask at layer $\ell + 1$ again zeros out all cross-tenant positions. Hence
+$I(A^{(\ell+1)}_{t_i}; B) = 0$, and the result holds for all $\mathcal{L}$ layers.
+\end{remark}
+
+% -----------------------------------------------------------------------------
+\subsection{Shared Prefix Safety}
+\label{sec:formal:shared}
+
+A natural concern is whether the shared prefix pages create an implicit information channel
+between tenants. We show they do not.
+
+\begin{theorem}[Shared Prefix Safety]
+\label{thm:shared-safety}
+Shared pages cannot serve as a channel for private data leakage between tenants. Formally,
+for all tenants $t_i, t_j$ with $i \neq j$:
+\begin{equation}
+    I\!\big(\{(k_\ell, v_\ell)\}_{\ell \in S};\; \mathrm{KV}_{\mathrm{private}}(t_j)\big) = 0.
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+The proof proceeds in three steps.
+
+\medskip
+\noindent\textbf{Step 1: Content invariance.}
+Shared pages contain only the system prompt and shared prefix tokens, which are
+\emph{identical} across all tenants and fixed before any private input is processed.
+Let $\mathbf{x}_S$ denote the shared token sequence. The KV entries for shared pages are
+$k_\ell = W_K \mathbf{x}_{S,\ell}$ and $v_\ell = W_V \mathbf{x}_{S,\ell}$, which are
+deterministic functions of $\mathbf{x}_S$ and the (fixed) model weights. Since
+$\mathbf{x}_S$ is independent of any tenant's private input, the shared KV content carries
+no information about private data:
+\begin{equation}
+    I\!\big(\{(k_\ell, v_\ell)\}_{\ell \in S};\; \mathrm{KV}_{\mathrm{private}}(t_j)\big) = 0.
+\end{equation}
+
+\medskip
+\noindent\textbf{Step 2: Uniform visibility.}
+By invariant~\eqref{eq:inv-shared}, the access set for all shared pages is
+$A = \mathcal{T}$. Every tenant observes \emph{the same} shared KV content with
+\emph{the same} mask value ($M_{t_i}[j] = 1$ for all $i$ and all $j \in S$). There is no
+tenant-specific variation in what is exposed, eliminating any covert signaling channel
+through selective visibility.
+
+\medskip
+\noindent\textbf{Step 3: No write-back channel.}
+The attention mechanism is a \emph{read-only} operation over the KV cache during the
+decode phase: $\mathrm{Attn}(q, K, V) = \mathrm{softmax}(qK^\top/\sqrt{d_k})V$.
+Tenant $t_i$'s queries do not modify the shared KV entries. While new tokens generated by
+$t_i$ are appended to $O_i$ (private pages), they are never written to shared pages.
+Therefore, tenant $t_i$ cannot encode information into the shared prefix that tenant $t_j$
+could later read.
+\end{proof}
+
+% -----------------------------------------------------------------------------
+\subsection{Scalability Analysis}
+\label{sec:formal:scalability}
+
+\begin{proposition}[TSAM Complexity]
+\label{prop:complexity}
+TSAM introduces the following overhead:
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
+    \item \textbf{Per-page metadata:} $O(1)$. Each typed page stores
+          $(\tau, \rho) = (1~\text{byte} + 4~\text{bytes}) = 5$~bytes of metadata,
+          independent of the number of tenants, sequence length, or model dimension.
+    \item \textbf{Total metadata:} $O(N_{\mathrm{blocks}})$, where $N_{\mathrm{blocks}}$
+          is the number of physical pages in the KV cache. Critically, this scales with
+          \emph{memory capacity}, not with the number of tenants.
+    \item \textbf{Mask generation:} $O(L)$ per query token, where $L$ is the total
+          sequence length. Generating $M_{t_i}$ requires one table lookup per KV position
+          to resolve the page type and compare the owner field.
+    \item \textbf{Tenant scalability:} \emph{Unlimited}. The number of tenants $N$
+          does not appear in any algebraic constraint on memory or compute. Adding a new
+          tenant requires only allocating private pages and setting $\rho = t_{\mathrm{new}}$;
+          no existing data structures are resized or reorganized.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+Claims (1)--(3) follow directly from the data structure definition in
+\S\ref{sec:formal:notation}: the metadata is constant per page, total metadata is a linear
+scan over pages, and mask generation requires one comparison per position. For claim (4),
+observe that the mask condition $t_i \in A(p_j)$ reduces to checking $\rho(p_j) \in \{t_i, \bot\}$
+under invariants~\eqref{eq:inv-shared}--\eqref{eq:inv-private}, which is $O(1)$ regardless
+of $N$.
+\end{proof}
+
+% -----------------------------------------------------------------------------
+\subsection{Comparison with Orthogonal Projection Methods}
+\label{sec:formal:orthogonal}
+
+Orthogonal projection methods~\cite{li2024orthogonal} achieve tenant isolation by mapping
+each tenant's queries and keys into orthogonal subspaces. We show this approach suffers
+from fundamental limitations that TSAM avoids.
+
+\begin{definition}[Orthogonal Projection Isolation]
+Each tenant $t_i$ is assigned a projection matrix $P_i = U_i U_i^\top \in \mathbb{R}^{d_{\mathrm{model}} \times d_{\mathrm{model}}}$,
+where $U_i \in \mathbb{R}^{d_{\mathrm{model}} \times d_{\mathrm{sub}}}$ has orthonormal columns
+spanning a $d_{\mathrm{sub}}$-dimensional subspace. Isolation requires mutual orthogonality:
+$P_i P_j = 0$ for all $i \neq j$.
+\end{definition}
+
+\begin{proposition}[Tenant Capacity Bound]
+\label{prop:ortho-capacity}
+Orthogonal projection isolation admits at most
+$N_{\max} = \lfloor d_{\mathrm{model}} / d_{\mathrm{sub}} \rfloor$
+tenants. For typical configurations ($d_{\mathrm{model}} = 4096$, $d_{\mathrm{sub}} = 256$),
+this yields $N_{\max} = 16$.
+\end{proposition}
+
+\begin{proof}
+The orthogonality constraint $P_i P_j = 0$ requires $\mathrm{range}(U_i) \perp \mathrm{range}(U_j)$
+for all $i \neq j$. Since $\mathbb{R}^{d_{\mathrm{model}}}$ can be decomposed into at most
+$\lfloor d_{\mathrm{model}} / d_{\mathrm{sub}} \rfloor$ mutually orthogonal subspaces
+of dimension $d_{\mathrm{sub}}$, the bound follows. With $d_{\mathrm{model}} = 4096$ and
+$d_{\mathrm{sub}} = 256$: $N_{\max} = \lfloor 4096 / 256 \rfloor = 16$.
+\end{proof}
+
+\begin{proposition}[Prefix Sharing Incompatibility]
+\label{prop:ortho-prefix}
+Orthogonal projection fundamentally prevents shared prefix optimization. For a shared
+key vector $k \in \mathbb{R}^{d_{\mathrm{model}}}$, the projected keys seen by different
+tenants differ:
+\begin{equation}
+    P_i k \neq P_j k \quad \text{for generic } k \text{ and } i \neq j,
+\end{equation}
+since $P_i$ and $P_j$ project onto orthogonal subspaces. Consequently, each tenant requires
+a separate copy of the shared prefix in its projected subspace, eliminating the
+$O(N)$-to-$O(1)$ memory savings that prefix sharing provides.
+\end{proposition}
+
+\begin{proof}
+Let $k = k_\parallel^{(i)} + k_\perp^{(i)}$ be the decomposition with respect to
+$\mathrm{range}(U_i)$. Then $P_i k = k_\parallel^{(i)}$ and $P_j k = k_\parallel^{(j)}$.
+Since $\mathrm{range}(U_i) \perp \mathrm{range}(U_j)$, we have
+$\langle P_i k, P_j k \rangle = 0$, so $P_i k = P_j k$ only if both projections are zero.
+For a generic $k$ (i.e., $k$ not in the null space of both $P_i$ and $P_j$), the projected
+keys are distinct nonzero vectors in orthogonal subspaces. Therefore, the physical KV cache
+entries cannot be shared---each tenant requires its own projected copy.
+\end{proof}
+
+\begin{table}[t]
+\centering
+\caption{Comparison of TSAM and orthogonal projection isolation. TSAM achieves
+strictly superior guarantees across all axes.}
+\label{tab:comparison}
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Property} & \textbf{Orthogonal Projection} & \textbf{TSAM} \\
+\midrule
+Isolation guarantee & $I(A;B) = 0$ & $I(A;B) = 0$ \\
+Max tenants & $\lfloor d_{\mathrm{model}}/d_{\mathrm{sub}} \rfloor$ (e.g., 16) & \emph{Unlimited} \\
+Prefix sharing & \ding{55}~Incompatible & \ding{51}~Native support \\
+Model modification & Required (projection layers) & None (mask only) \\
+Representation capacity & Reduced ($d_{\mathrm{sub}} < d_{\mathrm{model}}$) & Full $d_{\mathrm{model}}$ \\
+Per-tenant memory overhead & $O(d_{\mathrm{model}} \cdot d_{\mathrm{sub}})$ & $O(1)$ (5 bytes/page) \\
+\bottomrule
+\end{tabular}
+\end{table}
