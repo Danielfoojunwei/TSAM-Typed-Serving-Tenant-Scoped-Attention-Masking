@@ -1,0 +1,402 @@
+\documentclass[11pt]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage{neurips_2024}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+\usepackage{amsthm}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{pifont}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{natbib}
+
+% ── Theorem environments ─────────────────────────────────────────────────────
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+% ── Listings configuration ───────────────────────────────────────────────────
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  stringstyle=\color{red!70!black},
+  numberstyle=\tiny\color{gray},
+  numbers=left,
+  numbersep=5pt,
+  breaklines=true,
+  showstringspaces=false,
+  frame=single,
+  rulecolor=\color{black!30},
+  backgroundcolor=\color{gray!5},
+  tabsize=4,
+  captionpos=b
+}
+
+% ── Convenience macros ───────────────────────────────────────────────────────
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\xmark}{\ding{55}}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\title{TSAM: Typed Serving with Tenant-Scoped Attention Masking\\
+for Provably Secure Multi-Tenant LLM Inference}
+
+\author{Anonymous Authors\\NeurIPS 2024 Submission}
+
+\begin{document}
+\maketitle
+
+% ══════════════════════════════════════════════════════════════════════════════
+% ABSTRACT
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{abstract}
+Multi-tenant serving of large language models (LLMs) is economically
+essential---GPU costs make dedicated instances per tenant prohibitive at
+scale---yet sharing a single model instance across tenants introduces
+cross-tenant information flow through the shared key--value (KV) cache.
+Despite significant recent interest, \emph{no existing approach
+simultaneously achieves} (1)~provably zero information leakage between
+tenants, (2)~unlimited tenant scalability, and (3)~compatibility with
+prefix sharing, the principal memory optimization in production serving.
+Orthogonal subspace projection~\citep{li2024orthogonal} is limited to at
+most $d_{\mathrm{model}}/d_{\mathrm{sub}} \leq 16$ tenants and
+fundamentally destroys prefix sharing because each tenant's keys occupy a
+private subspace.  Process-level isolation preserves correctness but
+incurs 5--10$\times$ cost overhead, eliminating the economic rationale for
+shared serving.
+
+We present \textbf{TSAM} (\textbf{T}yped \textbf{S}erving with
+Tenant-Scoped \textbf{A}ttention \textbf{M}asking), a lightweight
+modification to PagedAttention~\citep{kwon2023vllm} that closes this gap.
+TSAM assigns each KV-cache page a \emph{type tag} drawn from a small set
+$\{\texttt{shared}, \texttt{private}(t)\}$ and enforces a single
+hard-masking conditional in the attention kernel: a query belonging to
+tenant~$t_i$ may attend to a page only if that page is tagged
+\texttt{shared} or \texttt{private}($t_i$).  We prove that the resulting
+mutual information satisfies
+$I\!\bigl(\mathrm{output}(q_i);\;\mathrm{KV}_{\mathrm{private}}(t_j)\bigr)
+= 0$ for all $i \neq j$---a \emph{structural zero}, not a statistical
+approximation.  Empirically, TSAM achieves \textbf{0.0 bits} of measured
+cross-tenant leakage, adds \textbf{$<$1\%} latency overhead to
+FlashAttention-2~\citep{dao2022flashattention} kernels, scales to an
+\textbf{unlimited} number of tenants, and delivers $\geq$\textbf{95\%}
+reduction in timing side-channel distinguishability via an optional
+constant-time padding defense.
+
+To the best of our knowledge, TSAM is the \emph{first} system to
+simultaneously achieve all three properties: provable zero leakage,
+arbitrary tenant scale, and full prefix sharing compatibility.
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════════════════════════
+% SECTION 1 — INTRODUCTION
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:introduction}
+
+Large language models (LLMs) such as GPT-4~\citep{brown2020language,
+achiam2023gpt4} power an expanding array of commercial applications---from
+customer-facing chatbots to enterprise document analysis---that serve
+thousands of tenants from a shared infrastructure.  The economic case is
+compelling: a single A100 or H100 GPU can cost \$2--4/hour, and dedicating
+one instance per tenant is infeasible beyond a handful of customers.
+Systems such as vLLM~\citep{kwon2023vllm} address this through
+\emph{PagedAttention}, which manages the KV-cache in fixed-size pages and
+enables \emph{continuous batching} of requests from different tenants
+within the same forward pass.  This design yields order-of-magnitude
+improvements in GPU utilization and throughput.
+
+However, batching requests from distinct tenants into a single attention
+computation creates a subtle but critical vulnerability: tokens from
+tenant~$t_i$ can, in principle, attend to KV-cache entries produced by
+tenant~$t_j$'s private context.  Recent work has shown that LLMs can
+memorize and regurgitate training data~\citep{carlini2021extracting}, and
+analogous risks arise at inference time when private KV-cache pages are
+accessible to cross-tenant queries.  The attention
+mechanism~\citep{vaswani2017attention} computes
+$\mathrm{softmax}(QK^\top/\sqrt{d_k})\,V$ over \emph{all} keys in the
+batch; without explicit isolation, every query has a nonzero attention
+weight on every key.
+
+\paragraph{The gap.}
+Despite the critical importance of multi-tenant LLM security, no existing
+approach simultaneously achieves (1)~provably zero information leakage
+between tenants, (2)~arbitrary tenant scalability, and (3)~compatibility
+with prefix sharing---the technique that avoids redundant computation of
+common system prompts.  This gap is a fundamental barrier to deploying
+shared LLM serving in regulated industries (healthcare, finance, legal)
+where formal isolation guarantees are a prerequisite.
+
+\paragraph{Limitations of existing approaches.}
+\emph{Process isolation} runs each tenant in a separate serving instance.
+While trivially correct, this approach incurs 5--10$\times$ cost overhead
+due to duplicated model weights and KV-cache, entirely negating the
+economic advantage of shared serving.
+\emph{Orthogonal subspace projection}~\citep{li2024orthogonal} maps each
+tenant's keys into a mutually orthogonal subspace of dimension
+$d_{\mathrm{sub}}$, ensuring that cross-tenant dot products vanish.
+However, the number of orthogonal subspaces is bounded by
+$d_{\mathrm{model}} / d_{\mathrm{sub}}$; for typical models with
+$d_{\mathrm{model}} = 4096$ and $d_{\mathrm{sub}} = 256$, this yields a
+hard ceiling of \textbf{16 tenants}.  Moreover, because each tenant's keys
+are rotated into a private subspace, prefix sharing is fundamentally
+destroyed: the same prompt produces different key vectors for different
+tenants, and no two tenants can share a cache page.
+\emph{Ad hoc attention masks} have been explored in concurrent
+work~\citep{gao2024attentionguard}, but these approaches lack formal
+information-flow proofs and do not address timing side channels.
+
+\paragraph{Our approach.}
+We present \textbf{TSAM} (Typed Serving with Tenant-Scoped Attention
+Masking), a principled and lightweight extension to PagedAttention that
+resolves all three limitations simultaneously.  TSAM introduces a
+single-bit \emph{type tag} per KV-cache page---\texttt{shared} or
+\texttt{private}($t$)---and enforces a hard-masking rule in the attention
+kernel: query $q$ from tenant $t_i$ may attend to page $p$ if and only if
+$\mathrm{type}(p) = \texttt{shared}$ or $\mathrm{owner}(p) = t_i$.  This
+conditional adds fewer than 10 instructions per page in the inner loop of
+FlashAttention-2 and yields a \emph{structural zero} in mutual
+information:
+\begin{equation}
+  I\!\bigl(\mathrm{output}(q_i);\;\mathrm{KV}_{\mathrm{private}}(t_j)\bigr) = 0
+  \quad \forall\; i \neq j.
+  \label{eq:structural_zero}
+\end{equation}
+Because the mask is enforced at the page level rather than the subspace
+level, tenant count is bounded only by available memory, and shared-prefix
+pages remain tagged \texttt{shared}---preserving prefix sharing without
+modification.
+
+\paragraph{Contributions.}
+We make the following contributions:
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item \textbf{Typed KV-cache pages.} We introduce a page-level type
+  system for the KV-cache that cleanly separates shared and
+  tenant-private state within the existing PagedAttention framework
+  (\S\ref{sec:method}).
+
+\item \textbf{Tenant-scoped attention masking.} We design a hard-masking
+  rule that is enforced inside the attention kernel, achieving provably
+  zero cross-tenant information flow with a single conditional per page
+  (\S\ref{sec:method}).
+
+\item \textbf{Formal security proof.} We prove that TSAM satisfies
+  noninterference~\citep{goguen1982security} under the lattice model of
+  information flow~\citep{denning1976lattice}, yielding $I = 0$ as a
+  structural invariant rather than a statistical bound
+  (\S\ref{sec:formal}).
+
+\item \textbf{Timing side-channel defense.} We present a constant-time
+  padding mechanism that eliminates sequence-length-dependent timing
+  variation, reducing timing distinguishability by $\geq$95\%
+  (\S\ref{sec:timing}).
+
+\item \textbf{Comprehensive evaluation.} We evaluate TSAM on
+  Llama-2-7B and Llama-2-13B under realistic multi-tenant workloads,
+  demonstrating 0.0 bits leakage, $<$1\% latency overhead, and linear
+  scaling to hundreds of concurrent tenants (\S\ref{sec:experiments}).
+\end{enumerate}
+
+\paragraph{Comparison with existing approaches.}
+Table~\ref{tab:comparison} summarizes the landscape.  TSAM is the only
+approach that achieves all four desiderata.
+
+\begin{table}[t]
+\centering
+\caption{Comparison of multi-tenant LLM isolation approaches.}
+\label{tab:comparison}
+\vspace{4pt}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Approach} & \textbf{Max Tenants} & \textbf{Prefix Sharing} & \textbf{Formal Guarantee} & \textbf{Overhead} \\
+\midrule
+Process Isolation          & Unlimited & \xmark & Trivial       & 5--10$\times$ \\
+Orth.\ Projection~\citep{li2024orthogonal} & $\leq 16$ & \xmark & $\epsilon$-approx & Moderate \\
+Ad hoc Masks~\citep{gao2024attentionguard}  & Unlimited & \cmark & None          & Low \\
+\textbf{TSAM (ours)}      & \textbf{Unlimited} & \cmark & \textbf{$I{=}0$ (structural)} & \textbf{$<$1\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════════════════════
+% SECTION 2 — BACKGROUND AND RELATED WORK
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Background and Related Work}
+\label{sec:background}
+
+\subsection{Multi-Tenant LLM Serving}
+\label{sec:bg_serving}
+
+Modern LLM serving systems process requests from many tenants on shared
+GPU infrastructure.  At the core of efficient serving lies the
+\emph{key--value (KV) cache}: during autoregressive generation, the key
+and value projections for all previously generated tokens are stored so
+that attention need not be recomputed from scratch at each decoding step.
+For a model with $L$ layers, $H$ attention heads, and head dimension
+$d_h$, the KV-cache for a single sequence of length $n$ requires
+$2 L H d_h n$ elements, consuming tens of gigabytes for long contexts.
+
+\textbf{PagedAttention}~\citep{kwon2023vllm} addresses KV-cache memory
+fragmentation by managing the cache in fixed-size \emph{pages} (typically
+16 tokens each), analogous to virtual memory in operating systems.  Pages
+are allocated on demand and can be shared across sequences via
+copy-on-write, enabling \emph{prefix sharing}: when multiple requests
+begin with the same system prompt, their common prefix pages are stored
+once and referenced by all.
+
+\textbf{Continuous batching}~\citep{yu2022orca} further improves
+throughput by dynamically inserting and removing requests from the GPU
+batch at each iteration, rather than waiting for an entire batch to
+complete.  Together, PagedAttention and continuous batching allow a single
+GPU to serve hundreds of concurrent sequences with high utilization.
+
+\textbf{Prefix sharing} is especially important in multi-tenant settings
+where many tenants share a common system prompt (e.g., ``You are a helpful
+assistant'').  Without prefix sharing, the KV-cache for shared prompts
+must be duplicated per tenant, wasting memory proportional to the number
+of tenants times the prompt length.  Any isolation mechanism that destroys
+prefix sharing therefore imposes a significant and scaling cost penalty.
+
+\subsection{Information Flow Security}
+\label{sec:bg_infoflow}
+
+The formal study of information flow in computing systems originates with
+Denning's \emph{lattice model}~\citep{denning1976lattice}, which assigns
+security labels to data objects and defines permitted information flows via
+a partial order on labels.  A system satisfies \emph{secure information
+flow} if, for every pair of labels $\ell_1 \not\leq \ell_2$, no
+information flows from objects at level $\ell_1$ to observers at level
+$\ell_2$.
+
+Goguen and Meseguer~\citep{goguen1982security} formalized this intuition
+as \emph{noninterference}: a system is noninterfering with respect to a
+high-security domain $H$ and a low-security domain $L$ if the outputs
+visible to $L$ are identical regardless of the inputs from $H$.  Formally,
+for a system function $f$ with inputs partitioned into $H$ and $L$
+components:
+\begin{equation}
+  f(h_1, l) = f(h_2, l) \quad \forall\; h_1, h_2 \in H,\; \forall\; l \in L.
+  \label{eq:noninterference}
+\end{equation}
+In the multi-tenant LLM setting, we treat each tenant's private data as a
+separate high-security domain and require that the outputs for tenant
+$t_i$ are independent of the private inputs of any other tenant $t_j$
+($j \neq i$).
+
+An equivalent information-theoretic characterization uses mutual
+information~\citep{shannon1948mathematical, cover2006elements}: a system
+achieves perfect isolation if
+$I(\mathrm{output}_i;\;\mathrm{input}_j) = 0$ for all $i \neq j$.  When
+this quantity is exactly zero (not merely bounded by $\epsilon$), we call
+it a \emph{structural zero}---it holds by construction rather than by
+parameter tuning or statistical estimation.
+
+\subsection{Cache Side-Channel Attacks}
+\label{sec:bg_sidechannel}
+
+Hardware cache side-channel attacks exploit timing differences in memory
+access patterns to infer secret data.
+Osvik~et~al.~\citep{osvik2006cache} demonstrated \emph{access-driven}
+attacks on AES, where the attacker observes which cache lines are evicted
+during encryption.  Yarom and Falkner~\citep{yarom2014flush} introduced
+\textsc{Flush+Reload}, a high-resolution attack exploiting shared memory
+pages in last-level caches to achieve cross-core information leakage.
+
+In the context of LLM serving, analogous side channels arise through the
+\emph{KV-cache}.  When multiple tenants share a PagedAttention cache pool,
+the set of pages allocated to a tenant, the timing of page allocations and
+evictions, and the sequence lengths (which determine the number of pages
+accessed during attention) can all leak information.  Specifically:
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Attention weight leakage.} Without masking, softmax
+    attention assigns nonzero weight to every key in the batch, including
+    keys from other tenants' private contexts.  Even small attention
+    weights create a nonzero information channel.
+  \item \textbf{Timing side channels.} The latency of attention
+    computation depends on the total number of KV-cache pages accessed.
+    An adversarial tenant can infer the sequence length of co-located
+    tenants by measuring response latency, potentially revealing
+    confidential information about the nature of their queries.
+  \item \textbf{Cache collision attacks.} In shared GPU memory, two
+    tenants accessing the same physical cache lines can observe
+    interference patterns, analogous to classical cache collision attacks
+    in CPUs.
+\end{itemize}
+TSAM addresses the first two channels directly: hard masking eliminates
+attention weight leakage, and optional constant-time padding neutralizes
+timing variation.  GPU-level cache collision attacks are orthogonal and
+require hardware-level mitigations beyond the scope of this work.
+
+\subsection{Existing Isolation Mechanisms}
+\label{sec:bg_isolation}
+
+We survey three categories of existing approaches to multi-tenant LLM
+isolation.
+
+\paragraph{Process isolation.}
+The most straightforward approach runs a separate model instance per
+tenant.  Each tenant's KV-cache is physically isolated, trivially
+guaranteeing noninterference.  However, this approach requires duplicating
+the full model weights ($\sim$14\,GB for a 7B-parameter model in FP16)
+and KV-cache per tenant, yielding 5--10$\times$ memory overhead and
+proportionally reduced throughput.  For $N$ tenants, the total memory
+scales as $O(N \cdot (W + C))$ where $W$ is the model weight size and $C$
+is the per-tenant cache size, compared to $O(W + N \cdot C)$ for shared
+serving.  Process isolation is therefore economically viable only for a
+small number of high-value tenants.
+
+\paragraph{Orthogonal subspace projection.}
+Li~et~al.~\citep{li2024orthogonal} propose projecting each tenant's key
+vectors into mutually orthogonal subspaces of the attention head
+dimension.  Given head dimension $d_h$, each tenant is assigned a
+subspace of dimension $d_{\mathrm{sub}}$, and the key projection is
+followed by a projection matrix $P_t \in \mathbb{R}^{d_h \times d_h}$
+that zeros out all components outside tenant $t$'s subspace.  Since the
+subspaces are orthogonal, cross-tenant dot products vanish:
+\begin{equation}
+  q_i^\top P_{t_i}^\top P_{t_j} k_j = q_i^\top (P_{t_i} P_{t_j})^\top k_j = 0
+  \quad \text{for } i \neq j,
+  \label{eq:orthogonal}
+\end{equation}
+because $P_{t_i} P_{t_j} = 0$ for orthogonal projections onto disjoint
+subspaces.  This approach has two critical limitations:
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Tenant scalability.} The maximum number of tenants is
+    $d_h / d_{\mathrm{sub}}$.  For Llama-2's head dimension $d_h = 128$
+    and a minimum practical subspace dimension $d_{\mathrm{sub}} = 8$,
+    this yields at most \textbf{16 tenants}.  Reducing $d_{\mathrm{sub}}$
+    further degrades model quality because the effective attention
+    dimension per tenant shrinks.
+  \item \textbf{Prefix sharing destruction.} Because each tenant's keys
+    are multiplied by a different projection matrix $P_t$, the same input
+    token produces different key vectors for different tenants.
+    Consequently, no two tenants can share KV-cache pages for a common
+    prefix---prefix sharing is \emph{fundamentally incompatible} with
+    subspace projection.
+\end{enumerate}
+
+\paragraph{Ad hoc attention masks.}
+Several concurrent works~\citep{gao2024attentionguard, rajput2024inference}
+propose applying attention masks to prevent cross-tenant attention.  While
+directionally similar to TSAM, these approaches differ in important ways:
+they operate at the token level rather than the page level (incurring
+higher metadata overhead), they do not provide formal information-flow
+proofs or noninterference guarantees, and they do not address timing side
+channels.  TSAM's contribution is to show that page-level typing, combined
+with a formal security model grounded in the lattice framework of
+Denning~\citep{denning1976lattice}, yields a provably correct and
+practically efficient isolation mechanism.
