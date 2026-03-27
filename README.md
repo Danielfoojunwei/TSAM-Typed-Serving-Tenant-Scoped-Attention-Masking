@@ -2,8 +2,6 @@
 
 > **Full paper**: See [`paper/main.tex`](paper/main.tex) for the LaTeX source.
 
-*Anonymous Authors --- NeurIPS 2024 Submission*
-
 ---
 
 ## Abstract
