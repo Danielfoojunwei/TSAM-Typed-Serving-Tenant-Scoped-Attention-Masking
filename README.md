@@ -469,15 +469,23 @@ All tests pass. No numerical precision issues arise because TSAM operates on int
 
 **Key insight.** *Isolation is a data-flow property best enforced at the attention level, not the representation level.* This aligns with the noninterference framework of [Goguen and Meseguer, 1982]: control which inputs influence outputs, rather than transforming inputs.
 
-### Limitations
+### Scope and Limitations
 
-**Scope.** TSAM protects KV-cache data flow, not model weights or training data [Carlini et al., 2021; Lukas et al., 2023]. Weight-based extraction is orthogonal.
+**Attention-layer guarantee only.** The I=0 proof (Theorem 1) applies to the output of a *single attention operation*. It guarantees that cross-tenant private KV entries contribute exactly zero weight to the attention output. However, this does NOT constitute an end-to-end guarantee over the full transformer model's output — non-attention components (MLP, LayerNorm, residual connections, embedding lookups) are shared across all sequences in a batch and are not covered by TSAM.
 
-**Detection window.** The DAI timing DFA requires $2K = 40$ queries before countermeasures activate. During this window, an adversary may extract limited information (amortized < 0.09 bits/query over 1,000 queries).
+**Shared prefix compute provenance.** Theorem 2 (Shared Prefix Safety) assumes shared KV entries are computed *only from public inputs* (system prompt + model weights). If shared prefix blocks are populated during a batch that also processes private data (with residual connections across layers), the shared KV entries may carry information about the private data. Deployments MUST ensure shared prefix KV is computed in isolation from any private context.
 
-**Reference implementation.** Production deployment requires full kernel fusion with FlashAttention [Dao et al., 2022; Dao, 2023] for optimal performance. Our Triton prototype demonstrates feasibility.
+**Multi-layer information propagation.** In a multi-layer transformer, TSAM masking at each layer prevents cross-tenant attention flow *within that layer*. However, information may propagate through the residual stream: if layer L's output (which includes attention over shared blocks) feeds into layer L+1, and shared blocks themselves carry correlated signals across tenants, indirect leakage through multiple hops has not been formally bounded.
 
-**Covert channels.** TSAM does not address model-behavior covert channels (e.g., prompt injection), which require application-layer defenses.
+**Metadata leakage.** The `page_type` and `tenant_id` metadata tensors are GPU-resident. An adversary with kernel-level visibility could observe block allocation patterns (number of blocks, allocation timing) to infer sequence lengths and usage patterns of co-tenants. TSAM does not obfuscate allocation metadata.
+
+**GPU-level side channels.** TSAM does not address GPU memory access pattern side channels (L2 cache timing, DRAM row buffer conflicts), CUDA scheduling observability, or power analysis. These require hardware-level or OS-level mitigations.
+
+**Detection window.** The DAI timing DFA requires $\sim$60 queries (3 windows of 20) before countermeasures activate. An adaptive adversary who stays below the sigma and KL thresholds can extract timing information indefinitely. The DFA provides a best-effort heuristic defense, not a formal guarantee.
+
+**Reference implementation.** Production deployment requires full kernel fusion with FlashAttention [Dao et al., 2022; Dao, 2023] for optimal performance. Our Triton prototype demonstrates feasibility but has not been validated in a production vLLM deployment.
+
+**Covert channels.** TSAM does not address model-behavior covert channels (e.g., prompt injection, output-semantic channels), which require application-layer defenses.
 
 ### Broader Impact
 

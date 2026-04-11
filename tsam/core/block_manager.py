@@ -13,6 +13,7 @@ Allocation paths:
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
@@ -45,6 +46,7 @@ class TypedBlockManager:
     _allocated: Dict[int, TypedPage] = field(init=False, repr=False)
     _tenant_blocks: Dict[TenantId, Set[int]] = field(init=False, repr=False)
     _shared_prefix_refcount: Dict[int, int] = field(init=False, repr=False)
+    _lock: threading.Lock = field(init=False, repr=False)
 
     def __post_init__(self):
         self.page_type = torch.zeros(
@@ -57,6 +59,7 @@ class TypedBlockManager:
         self._allocated = {}
         self._tenant_blocks = {}
         self._shared_prefix_refcount = {}
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Allocation
@@ -64,61 +67,70 @@ class TypedBlockManager:
 
     def allocate_private(self, tenant: TenantId, count: int = 1) -> List[TypedPage]:
         """Allocate *count* PRIVATE blocks for *tenant*."""
-        if len(self._free_blocks) < count:
-            raise RuntimeError(
-                f"Cannot allocate {count} blocks: only {len(self._free_blocks)} free"
-            )
-        pages: List[TypedPage] = []
-        for _ in range(count):
-            blk = self._free_blocks.popleft()
-            page = TypedPage(
-                block_id=blk,
-                tenant_id=tenant,
-                page_type=PageType.PRIVATE,
-            )
-            self._register(page)
-            pages.append(page)
-        return pages
+        with self._lock:
+            if len(self._free_blocks) < count:
+                raise RuntimeError(
+                    f"Cannot allocate {count} blocks: only {len(self._free_blocks)} free"
+                )
+            pages: List[TypedPage] = []
+            for _ in range(count):
+                blk = self._free_blocks.popleft()
+                page = TypedPage(
+                    block_id=blk,
+                    tenant_id=tenant,
+                    page_type=PageType.PRIVATE,
+                )
+                self._register(page)
+                pages.append(page)
+            return pages
 
     def allocate_shared(self, count: int = 1) -> List[TypedPage]:
         """Allocate *count* SHARED blocks (system prompts, common prefixes)."""
-        if len(self._free_blocks) < count:
-            raise RuntimeError(
-                f"Cannot allocate {count} blocks: only {len(self._free_blocks)} free"
-            )
-        pages: List[TypedPage] = []
-        for _ in range(count):
-            blk = self._free_blocks.popleft()
-            page = TypedPage(
-                block_id=blk,
-                tenant_id=SHARED_TENANT_ID,
-                page_type=PageType.SHARED,
-            )
-            self._register(page)
-            self._shared_prefix_refcount[blk] = 0
-            pages.append(page)
-        return pages
+        with self._lock:
+            if len(self._free_blocks) < count:
+                raise RuntimeError(
+                    f"Cannot allocate {count} blocks: only {len(self._free_blocks)} free"
+                )
+            pages: List[TypedPage] = []
+            for _ in range(count):
+                blk = self._free_blocks.popleft()
+                page = TypedPage(
+                    block_id=blk,
+                    tenant_id=SHARED_TENANT_ID,
+                    page_type=PageType.SHARED,
+                )
+                self._register(page)
+                self._shared_prefix_refcount[blk] = 0
+                pages.append(page)
+            return pages
 
     def ref_shared(self, block_id: int) -> None:
         """Increment reference count for a SHARED block (prefix sharing)."""
-        if block_id not in self._shared_prefix_refcount:
-            raise ValueError(f"Block {block_id} is not a SHARED block")
-        self._shared_prefix_refcount[block_id] += 1
+        with self._lock:
+            if block_id not in self._shared_prefix_refcount:
+                raise ValueError(f"Block {block_id} is not a SHARED block")
+            self._shared_prefix_refcount[block_id] += 1
 
     def unref_shared(self, block_id: int) -> None:
         """Decrement reference count for a SHARED block; free if zero."""
-        if block_id not in self._shared_prefix_refcount:
-            raise ValueError(f"Block {block_id} is not a SHARED block")
-        self._shared_prefix_refcount[block_id] -= 1
-        if self._shared_prefix_refcount[block_id] <= 0:
-            self.free(block_id)
+        with self._lock:
+            if block_id not in self._shared_prefix_refcount:
+                raise ValueError(f"Block {block_id} is not a SHARED block")
+            self._shared_prefix_refcount[block_id] -= 1
+            if self._shared_prefix_refcount[block_id] <= 0:
+                self._free_block_internal(block_id)
 
     # ------------------------------------------------------------------
     # Deallocation
     # ------------------------------------------------------------------
 
     def free(self, block_id: int) -> None:
-        """Return a block to the free pool."""
+        """Return a block to the free pool (thread-safe)."""
+        with self._lock:
+            self._free_block_internal(block_id)
+
+    def _free_block_internal(self, block_id: int) -> None:
+        """Internal free — caller must hold self._lock."""
         if block_id not in self._allocated:
             raise ValueError(f"Block {block_id} is not allocated")
         page = self._allocated.pop(block_id)
@@ -135,11 +147,12 @@ class TypedBlockManager:
 
     def free_tenant(self, tenant: TenantId) -> int:
         """Free all PRIVATE blocks owned by *tenant*. Returns count freed."""
-        blocks = list(self._tenant_blocks.get(tenant, set()))
-        for blk in blocks:
-            if blk in self._allocated and self._allocated[blk].page_type == PageType.PRIVATE:
-                self.free(blk)
-        return len(blocks)
+        with self._lock:
+            blocks = list(self._tenant_blocks.get(tenant, set()))
+            for blk in blocks:
+                if blk in self._allocated and self._allocated[blk].page_type == PageType.PRIVATE:
+                    self._free_block_internal(blk)
+            return len(blocks)
 
     # ------------------------------------------------------------------
     # Queries

@@ -148,7 +148,10 @@ def tsam_paged_attention_batched(
     causal: bool = True,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Batched TSAM paged attention.
+    """Batched TSAM paged attention (vectorized).
+
+    Processes the entire batch in parallel using tensor operations rather
+    than a sequential Python loop.
 
     Args:
         queries:        (batch_size, num_heads, head_dim).
@@ -167,20 +170,69 @@ def tsam_paged_attention_batched(
         (batch_size, num_heads, head_dim).
     """
     batch_size = queries.shape[0]
-    outputs = []
-    for b in range(batch_size):
-        out = tsam_paged_attention(
-            query=queries[b].unsqueeze(0),
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_table=block_tables[b],
-            page_type=page_type,
-            tenant_id_meta=tenant_id_meta,
-            query_tenant=int(query_tenants[b].item()),
-            page_size=page_size,
-            seq_len_kv=int(seq_lens_kv[b].item()),
-            causal=causal,
-            scale=scale,
-        )
-        outputs.append(out)
-    return torch.cat(outputs, dim=0)
+    num_heads = queries.shape[1]
+    head_dim = queries.shape[2]
+    num_kv_heads = key_cache.shape[2]
+    max_blocks_per_seq = block_tables.shape[1]
+    max_seq_len_kv = int(seq_lens_kv.max().item())
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(head_dim)
+
+    # --- Gather KV from paged cache for the entire batch ---
+    # block_tables: (batch_size, max_blocks_per_seq) -> physical block IDs
+    # We gather all KV blocks and reshape into (batch_size, max_seq_len_kv, ...)
+    flat_block_ids = block_tables.reshape(-1)  # (batch_size * max_blocks_per_seq,)
+    # Gather keys: (batch_size * max_blocks_per_seq, page_size, num_kv_heads, head_dim)
+    gathered_keys = key_cache[flat_block_ids]
+    gathered_values = value_cache[flat_block_ids]
+    # Reshape to (batch_size, max_blocks_per_seq * page_size, num_kv_heads, head_dim)
+    total_positions = max_blocks_per_seq * page_size
+    gathered_keys = gathered_keys.reshape(batch_size, total_positions, num_kv_heads, head_dim)
+    gathered_values = gathered_values.reshape(batch_size, total_positions, num_kv_heads, head_dim)
+    # Truncate to max_seq_len_kv.
+    gathered_keys = gathered_keys[:, :max_seq_len_kv]      # (B, S, Hkv, D)
+    gathered_values = gathered_values[:, :max_seq_len_kv]  # (B, S, Hkv, D)
+
+    # GQA/MQA: repeat KV heads to match query heads.
+    num_groups = num_heads // num_kv_heads
+    if num_groups > 1:
+        # (B, S, Hkv, D) -> (B, S, Hkv, G, D) -> (B, S, H, D)
+        gathered_keys = gathered_keys.unsqueeze(3).expand(
+            -1, -1, -1, num_groups, -1
+        ).reshape(batch_size, max_seq_len_kv, num_heads, head_dim)
+        gathered_values = gathered_values.unsqueeze(3).expand(
+            -1, -1, -1, num_groups, -1
+        ).reshape(batch_size, max_seq_len_kv, num_heads, head_dim)
+
+    # --- Compute attention scores ---
+    # queries: (B, H, D) -> (B, H, 1, D)
+    q = queries.unsqueeze(2)
+    # keys: (B, S, H, D) -> (B, H, D, S)
+    k = gathered_keys.permute(0, 2, 3, 1)
+    # scores: (B, H, 1, S)
+    scores = torch.matmul(q, k) * scale
+
+    # --- Generate and apply TSAM mask (vectorized) ---
+    tsam_mask = generate_tsam_mask_batched(
+        block_tables=block_tables,
+        page_type=page_type,
+        tenant_id=tenant_id_meta,
+        query_tenants=query_tenants,
+        page_size=page_size,
+        seq_lens_kv=seq_lens_kv,
+        max_seq_len_kv=max_seq_len_kv,
+        device=queries.device,
+    )
+    # tsam_mask: (B, max_seq_len_kv) bool. Expand to (B, 1, 1, S) for broadcasting.
+    mask_expanded = tsam_mask.unsqueeze(1).unsqueeze(2)
+    scores = scores.masked_fill(~mask_expanded, -float("inf"))
+
+    # --- Softmax and weighted sum ---
+    weights = F.softmax(scores, dim=-1)  # (B, H, 1, S)
+    # values: (B, S, H, D) -> (B, H, S, D)
+    v = gathered_values.permute(0, 2, 1, 3)
+    # output: (B, H, 1, D) -> (B, H, D)
+    output = torch.matmul(weights, v).squeeze(2)
+
+    return output

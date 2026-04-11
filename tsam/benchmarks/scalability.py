@@ -8,6 +8,7 @@ and documents Paper 5 orthogonal projection failure beyond 16 tenants.
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -38,6 +39,7 @@ class ScalabilityResult:
     cross_tenant_weights: float
     defense: str
     failure_mode: Optional[str] = None
+    sampling_note: Optional[str] = None
 
 
 class Paper5OrthogonalProjection:
@@ -72,6 +74,10 @@ class Paper5OrthogonalProjection:
     def allocate_subspace(self, tenant_id: int) -> Optional[torch.Tensor]:
         """Allocate an orthogonal subspace projection matrix for a tenant.
 
+        Uses QR decomposition of a random matrix to generate a proper random
+        orthogonal basis (not trivial identity submatrices), ensuring a fair
+        comparison that matches the methodology of the cited paper.
+
         Returns:
             Projection matrix of shape (d_model, d_model), or None if
             dimensionality is exhausted.
@@ -79,14 +85,25 @@ class Paper5OrthogonalProjection:
         if len(self._projection_matrices) >= self.max_tenants:
             return None
 
-        # Generate orthogonal basis vectors for this tenant's subspace.
         offset = len(self._projection_matrices) * self.d_sub
         if offset + self.d_sub > self.d_model:
             return None
 
-        # Projection matrix P_i = U_i @ U_i^T where U_i is (d_model, d_sub).
-        U = torch.zeros(self.d_model, self.d_sub)
-        U[offset : offset + self.d_sub, :] = torch.eye(self.d_sub)
+        # Generate a full orthogonal basis via QR decomposition of a random
+        # matrix (seeded for reproducibility), then extract the slice for this
+        # tenant. This produces a proper random orthogonal subspace rather
+        # than the trivial identity subspace used previously.
+        if not hasattr(self, "_orthogonal_basis"):
+            # Generate once: a d_model x d_model orthogonal matrix Q.
+            gen = torch.Generator()
+            gen.manual_seed(0)  # Reproducible.
+            random_matrix = torch.randn(self.d_model, self.d_model, generator=gen)
+            Q, _ = torch.linalg.qr(random_matrix)
+            self._orthogonal_basis = Q
+
+        # Tenant's basis: columns [offset : offset + d_sub] of Q.
+        U = self._orthogonal_basis[:, offset : offset + self.d_sub]  # (d_model, d_sub)
+        # Projection matrix P_i = U_i @ U_i^T.
         P = U @ U.T  # (d_model, d_model)
 
         self._projection_matrices[tenant_id] = P
@@ -175,8 +192,20 @@ class ScalabilityBenchmark:
         max_cross_weight = 0.0
         seq_len_kv = (shared_blocks + blocks_per_tenant) * self.page_size
 
-        # Sample a subset of tenants for large N.
-        test_tenants = list(range(min(num_tenants, 100)))
+        # For num_tenants <= 200, test ALL tenants (no sampling).
+        # For num_tenants > 200, use a reproducible random sample of at least 200.
+        sampling_note: Optional[str] = None
+        if num_tenants <= 200:
+            test_tenants = list(range(num_tenants))
+        else:
+            sample_size = max(200, num_tenants // 10)
+            sample_size = min(sample_size, num_tenants)
+            rng = random.Random(42)  # Documented seed for reproducibility
+            test_tenants = sorted(rng.sample(range(num_tenants), sample_size))
+            sampling_note = (
+                f"Sampled {sample_size} of {num_tenants} tenants "
+                f"(random seed=42) for mask correctness testing."
+            )
 
         for query_t in test_tenants:
             # Build block table: shared + own private.
@@ -207,43 +236,60 @@ class ScalabilityBenchmark:
             if mask_result.num_blocked != expected_blocked:
                 all_correct = False
 
-        # Now test cross-tenant isolation explicitly.
-        # Pick two different tenants and put their blocks in the same block table.
+        # Now test cross-tenant isolation explicitly with random pairs.
+        # Test at least 10 random (victim, attacker) pairs in addition to the
+        # deterministic pair (0, 1).  Uses a documented seed for reproducibility.
         if num_tenants >= 2:
-            t_victim = 0
-            t_attacker = 1
-            # Block table with victim's private blocks (attacker shouldn't see them).
-            mixed_bt = shared_ids + tenant_block_ids[t_victim] + tenant_block_ids[t_attacker]
-            mixed_block_table = torch.tensor(
-                mixed_bt, dtype=torch.int32, device=self.device
-            )
-            mixed_seq_len = len(mixed_bt) * self.page_size
+            pair_rng = random.Random(123)  # Documented seed for pair selection
+            # Always include the canonical (0, 1) pair, plus random pairs.
+            cross_pairs = [(0, 1)]
+            all_tenant_ids = list(range(num_tenants))
+            num_random_pairs = max(10, min(50, num_tenants // 10))
+            for _ in range(num_random_pairs):
+                a, b = pair_rng.sample(all_tenant_ids, 2)
+                cross_pairs.append((a, b))
+            # Deduplicate while preserving order.
+            seen_pairs = set()
+            unique_pairs = []
+            for pair in cross_pairs:
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    unique_pairs.append(pair)
+            cross_pairs = unique_pairs
 
-            mask_result = generate_tsam_mask(
-                block_table=mixed_block_table,
-                page_type=bm.page_type,
-                tenant_id=bm.tenant_id,
-                query_tenant=t_attacker,
-                page_size=self.page_size,
-                seq_len_kv=mixed_seq_len,
-                device=self.device,
-            )
+            for t_victim, t_attacker in cross_pairs:
+                # Block table with victim's private blocks (attacker shouldn't see them).
+                mixed_bt = shared_ids + tenant_block_ids[t_victim] + tenant_block_ids[t_attacker]
+                mixed_block_table = torch.tensor(
+                    mixed_bt, dtype=torch.int32, device=self.device
+                )
+                mixed_seq_len = len(mixed_bt) * self.page_size
 
-            # Victim's private positions should be blocked.
-            victim_start = shared_blocks * self.page_size
-            victim_end = victim_start + blocks_per_tenant * self.page_size
-            victim_mask = mask_result.mask[victim_start:victim_end]
+                mask_result = generate_tsam_mask(
+                    block_table=mixed_block_table,
+                    page_type=bm.page_type,
+                    tenant_id=bm.tenant_id,
+                    query_tenant=t_attacker,
+                    page_size=self.page_size,
+                    seq_len_kv=mixed_seq_len,
+                    device=self.device,
+                )
 
-            if victim_mask.any():
-                all_correct = False
-                max_cross_weight = 1.0  # Indicates leakage.
+                # Victim's private positions should be blocked.
+                victim_start = shared_blocks * self.page_size
+                victim_end = victim_start + blocks_per_tenant * self.page_size
+                victim_mask = mask_result.mask[victim_start:victim_end]
 
-            # Attacker's own positions should be allowed.
-            attacker_start = victim_end
-            attacker_end = attacker_start + blocks_per_tenant * self.page_size
-            attacker_mask = mask_result.mask[attacker_start:attacker_end]
-            if not attacker_mask.all():
-                all_correct = False
+                if victim_mask.any():
+                    all_correct = False
+                    max_cross_weight = 1.0  # Indicates leakage.
+
+                # Attacker's own positions should be allowed.
+                attacker_start = victim_end
+                attacker_end = attacker_start + blocks_per_tenant * self.page_size
+                attacker_mask = mask_result.mask[attacker_start:attacker_end]
+                if not attacker_mask.all():
+                    all_correct = False
 
         leakage = 0.0 if all_correct else float("inf")
 
@@ -285,12 +331,16 @@ class ScalabilityBenchmark:
                 break
 
         # Test cross-tenant isolation.
+        # Note: orthogonal projection achieves ε-approximate isolation (not exact).
+        # With random orthogonal bases and float32 arithmetic, cross-tenant scores
+        # of ~1e-5 are expected due to numerical precision limits of QR decomposition.
+        # This is a fundamental limitation of the approach vs. TSAM's exact zero.
         if all_correct and num_tenants >= 2:
             kv_0 = torch.randn(1, self.d_model)
             kv_1 = torch.randn(1, self.d_model)
             score = paper5.verify_isolation(kv_0, kv_1, 0, 1)
             max_cross_score = score
-            if score > 1e-6:
+            if score > 1e-4:  # Realistic threshold for float32 orthogonal projection.
                 all_correct = False
 
         return ScalabilityResult(
