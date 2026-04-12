@@ -1,7 +1,8 @@
 \documentclass[11pt]{article}
 
 % ── Packages ──────────────────────────────────────────────────────────────────
-\usepackage{neurips_2024}
+% \usepackage{neurips_2024}  % Removed: this is a technical report, not a conference submission.
+\usepackage[margin=1in]{geometry}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{amsmath}
@@ -51,10 +52,12 @@
 \newcommand{\xmark}{\ding{55}}
 
 % ══════════════════════════════════════════════════════════════════════════════
-\title{TSAM: Typed Serving with Tenant-Scoped Attention Masking\\
-for Provably Secure Multi-Tenant LLM Inference}
+\title{TSAM: Tenant-Scoped Attention Masking\\
+for Isolated Multi-Tenant LLM Serving\\[0.5em]
+\large Technical Report}
 
-\author{Anonymous Authors\\NeurIPS 2024 Submission}
+\author{Open Source Contributors}
+\date{2025}
 
 \begin{document}
 \maketitle
@@ -63,42 +66,31 @@ for Provably Secure Multi-Tenant LLM Inference}
 % ABSTRACT
 % ══════════════════════════════════════════════════════════════════════════════
 \begin{abstract}
-Multi-tenant serving of large language models (LLMs) is economically
-essential---GPU costs make dedicated instances per tenant prohibitive at
-scale---yet sharing a single model instance across tenants introduces
-cross-tenant information flow through the shared key--value (KV) cache.
-Despite significant recent interest, \emph{no existing approach
-simultaneously achieves} (1)~provably zero information leakage between
-tenants, (2)~unlimited tenant scalability, and (3)~compatibility with
-prefix sharing, the principal memory optimization in production serving.
-Orthogonal subspace projection~\citep{li2024orthogonal} is limited to at
-most $d_{\mathrm{model}}/d_{\mathrm{sub}} \leq 16$ tenants and
-fundamentally destroys prefix sharing because each tenant's keys occupy a
-private subspace.  Process-level isolation preserves correctness but
-incurs 5--10$\times$ cost overhead, eliminating the economic rationale for
-shared serving.
+This technical report describes \textbf{TSAM} (Tenant-Scoped Attention
+Masking), an open-source extension to PagedAttention~\citep{kwon2023vllm}
+that isolates tenants in shared LLM serving by masking cross-tenant
+KV-cache entries in the attention kernel.
 
-We present \textbf{TSAM} (\textbf{T}yped \textbf{S}erving with
-Tenant-Scoped \textbf{A}ttention \textbf{M}asking), a lightweight
-modification to PagedAttention~\citep{kwon2023vllm} that closes this gap.
-TSAM assigns each KV-cache page a \emph{type tag} drawn from a small set
-$\{\texttt{shared}, \texttt{private}(t)\}$ and enforces a single
-hard-masking conditional in the attention kernel: a query belonging to
-tenant~$t_i$ may attend to a page only if that page is tagged
-\texttt{shared} or \texttt{private}($t_i$).  We prove that the resulting
-mutual information satisfies
-$I\!\bigl(\mathrm{output}(q_i);\;\mathrm{KV}_{\mathrm{private}}(t_j)\bigr)
-= 0$ for all $i \neq j$---a \emph{structural zero}, not a statistical
-approximation.  Empirically, TSAM achieves \textbf{0.0 bits} of measured
-cross-tenant leakage, adds \textbf{$<$1\%} latency overhead to
-FlashAttention-2~\citep{dao2022flashattention} kernels, scales to an
-\textbf{unlimited} number of tenants, and delivers $\geq$\textbf{95\%}
-reduction in timing side-channel distinguishability via an optional
-constant-time padding defense.
+TSAM tags each KV-cache page as \texttt{SHARED} or
+\texttt{PRIVATE(tenant\_id)} and masks cross-tenant private pages to
+$-\infty$ before softmax.  Since $\exp(-\infty) = 0$ exactly (IEEE~754),
+the attention output at any tenant's positions is structurally independent
+of other tenants' private data.  This isolation composes through all $L$
+layers of a standard transformer under four conditions: (C1)~masking at
+every attention layer, (C2)~shared prefix computed from public inputs only,
+(C3)~position-local non-attention operations, and (C4)~frozen shared
+weights.  We verify empirically that the attacker's output is bitwise
+identical regardless of the victim's private data, across transformers
+with 1--24 layers, and that a linear probing attack achieves only random
+chance (11.7\% vs.\ 12.5\% baseline) under TSAM while achieving 100\%
+extraction accuracy without it.
 
-To the best of our knowledge, TSAM is the \emph{first} system to
-simultaneously achieve all three properties: provable zero leakage,
-arbitrary tenant scale, and full prefix sharing compatibility.
+TSAM is a practical engineering solution, not a research breakthrough.  Its
+value lies in the deployment checklist (C1--C4), the open-source
+implementation with 117 tests, and the explicit documentation of what it
+does and does not protect against.  It does not address GPU-level
+side channels, malicious operators, or non-attention information channels.
+Code: \url{https://github.com/danielfoojunwei/tsam-typed-serving-tenant-scoped-attention-masking}.
 \end{abstract}
 
 % ══════════════════════════════════════════════════════════════════════════════
