@@ -46,6 +46,14 @@ class TimingDFAState(enum.Enum):
     ATTACK_CONFIRMED = "ATTACK_CONFIRMED"
 
 
+class TimingDefenseMode(enum.Enum):
+    """Mode of timing defense countermeasure."""
+
+    GAUSSIAN_NOISE = "GAUSSIAN_NOISE"     # Add Gaussian noise (default, weak).
+    CONSTANT_TIME = "CONSTANT_TIME"       # Pad all responses to worst-case latency (strong).
+    QUANTIZED = "QUANTIZED"               # Round response times to bucket boundaries (moderate).
+
+
 @dataclass
 class TimingDFAConfig:
     """Configuration for the timing attack DFA.
@@ -58,6 +66,9 @@ class TimingDFAConfig:
         rate_limit_factor:     Multiplier for inter-request delay on attack (e.g., 2.0 = 2x).
         cooldown_queries:      Queries after which ATTACK_CONFIRMED drops back to NORMAL
                                if behavior normalizes.
+        defense_mode:          Which countermeasure to apply (see TimingDefenseMode).
+        constant_time_target_ms: Target latency for constant-time mode (worst case).
+        quantization_bucket_ms:  Bucket size for quantized mode (e.g., 10ms).
         benign_distribution:   Reference benign timing distribution (histogram bins).
         benign_bin_edges:      Bin edges for the benign distribution histogram.
     """
@@ -68,6 +79,9 @@ class TimingDFAConfig:
     noise_sigma_ms: float = 5.0
     rate_limit_factor: float = 2.0
     cooldown_queries: int = 100
+    defense_mode: TimingDefenseMode = TimingDefenseMode.GAUSSIAN_NOISE
+    constant_time_target_ms: float = 200.0  # Worst-case response time for CT mode.
+    quantization_bucket_ms: float = 10.0    # Bucket size for quantized mode.
     benign_distribution: Optional[np.ndarray] = None
     benign_bin_edges: Optional[np.ndarray] = None
 
@@ -236,12 +250,41 @@ class TimingDFA:
             ts.queries_in_state = 0
 
     def _handle_attack_confirmed(self, ts: TenantTimingState) -> "DFAAction":
-        action = DFAAction(
-            inject_noise=True,
-            noise_delay_ms=abs(np.random.normal(0, self.config.noise_sigma_ms)),
-            rate_limit=True,
-            rate_limit_factor=self.config.rate_limit_factor,
-        )
+        mode = self.config.defense_mode
+
+        if mode == TimingDefenseMode.CONSTANT_TIME:
+            # Pad response to a fixed target latency — strongest defense.
+            # The actual delay = target - elapsed (computed by the middleware).
+            action = DFAAction(
+                inject_noise=True,
+                noise_delay_ms=self.config.constant_time_target_ms,
+                rate_limit=True,
+                rate_limit_factor=self.config.rate_limit_factor,
+                constant_time=True,
+            )
+        elif mode == TimingDefenseMode.QUANTIZED:
+            # Round response time to nearest bucket — moderate defense.
+            bucket = self.config.quantization_bucket_ms
+            last_rt = ts.response_times_ms[-1] if ts.response_times_ms else 50.0
+            quantized_target = ((last_rt // bucket) + 1) * bucket
+            pad_ms = max(0.0, quantized_target - last_rt)
+            action = DFAAction(
+                inject_noise=True,
+                noise_delay_ms=pad_ms,
+                rate_limit=True,
+                rate_limit_factor=self.config.rate_limit_factor,
+                constant_time=False,
+            )
+        else:
+            # Gaussian noise — default, weakest defense.
+            action = DFAAction(
+                inject_noise=True,
+                noise_delay_ms=abs(np.random.normal(0, self.config.noise_sigma_ms)),
+                rate_limit=True,
+                rate_limit_factor=self.config.rate_limit_factor,
+                constant_time=False,
+            )
+
         ts.noise_injected_count += 1
         ts.rate_limited_count += 1
 
@@ -263,12 +306,16 @@ class DFAAction:
 
     The serving middleware should apply these actions to the tenant's
     subsequent requests.
+
+    If constant_time=True, noise_delay_ms is the TARGET total latency
+    (the middleware should pad to this value, not add it on top).
     """
 
     inject_noise: bool = False
     noise_delay_ms: float = 0.0
     rate_limit: bool = False
     rate_limit_factor: float = 1.0
+    constant_time: bool = False
 
 
 class TimingDFAMiddleware:
@@ -285,7 +332,12 @@ class TimingDFAMiddleware:
             elapsed_ms = (time.monotonic() - start) * 1000
             action = middleware.post_request(tenant_id, elapsed_ms)
             if action.inject_noise:
-                await asyncio.sleep(action.noise_delay_ms / 1000.0)
+                if action.constant_time:
+                    # Pad to target: sleep for (target - elapsed).
+                    pad_ms = max(0.0, action.noise_delay_ms - elapsed_ms)
+                    await asyncio.sleep(pad_ms / 1000.0)
+                else:
+                    await asyncio.sleep(action.noise_delay_ms / 1000.0)
             return response
     """
 
@@ -295,6 +347,18 @@ class TimingDFAMiddleware:
     def post_request(self, tenant_id: TenantId, response_time_ms: float) -> DFAAction:
         """Called after each request completes. Returns action for this tenant."""
         return self.dfa.observe(tenant_id, response_time_ms)
+
+    def compute_pad_ms(self, action: DFAAction, elapsed_ms: float) -> float:
+        """Compute the actual delay to inject based on the action and elapsed time.
+
+        For constant-time mode: pads to the target latency.
+        For noise/quantized mode: adds the noise delay on top.
+        """
+        if not action.inject_noise:
+            return 0.0
+        if action.constant_time:
+            return max(0.0, action.noise_delay_ms - elapsed_ms)
+        return action.noise_delay_ms
 
     def should_delay_request(self, tenant_id: TenantId) -> float:
         """Returns additional delay in ms if tenant is rate-limited, else 0."""

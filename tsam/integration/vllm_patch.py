@@ -13,6 +13,14 @@ This module provides:
   1. TSAMBlockTableExtension — wraps vLLM BlockTable with page_type and tenant_id.
   2. TSAMAttentionWrapper — wraps vLLM attention backend forward() to inject TSAM mask.
   3. Monkey-patch functions for in-place vLLM modification.
+
+Status: reference implementation. The CUDA patch returned by
+generate_vllm_kernel_patch() is a *patch sketch*. It uses -INFINITY for masked
+logits (matching the Python reference, which uses float("-inf"); IEEE 754 §6.1
+guarantees exp(-inf) = +0 exactly), and the masking branch is positioned after
+qk's declaration. Production deployment still requires applying the patch to a
+pinned vLLM commit, compiling the CUDA extension, and running an end-to-end
+integration test on real model weights — none of which is performed here.
 """
 
 from __future__ import annotations
@@ -172,6 +180,12 @@ class TSAMAttentionWrapper:
         Generates the TSAM mask and passes it to the backend as an additional
         attention mask. For backends that support custom masks (Flash Attention v2),
         the mask is passed directly. For others, it's applied post-hoc.
+
+        Precondition: every row of the combined mask must contain at least one
+        unmasked position. Otherwise softmax denominator would be exp(-inf)=0
+        and the output would be NaN. This is enforced via assert_any_unmasked,
+        which raises AllMaskedError; callers must guarantee that every query has
+        at least one shared or own-private page in its block table.
         """
         tsam_mask = self.tsam_ext.generate_mask_batched(
             block_tables=block_tables,
@@ -189,6 +203,9 @@ class TSAMAttentionWrapper:
                 combined_mask = existing_mask & tsam_mask
             else:
                 combined_mask = tsam_mask
+
+            assert_any_unmasked(combined_mask, seq_lens_kv)
+
             kwargs["attn_mask"] = combined_mask
             return self.backend.forward(
                 query=query,
@@ -202,6 +219,40 @@ class TSAMAttentionWrapper:
         raise AttributeError(
             f"Backend {type(self.backend)} does not have a forward() method"
         )
+
+
+class AllMaskedError(RuntimeError):
+    """Raised when every key position in a query row is masked.
+
+    A row with no unmasked key would produce exp(-inf) = 0 for every position,
+    leaving softmax with a zero denominator and NaN output. Production callers
+    must guarantee at least one shared or own-private page per query.
+    """
+
+
+def assert_any_unmasked(
+    mask: torch.Tensor, seq_lens_kv: torch.Tensor
+) -> None:
+    """Assert that every query row has at least one unmasked key within its valid length.
+
+    Args:
+        mask: Bool tensor (batch, max_seq_len_kv). True = attend.
+        seq_lens_kv: Int tensor (batch,) of actual KV lengths per row.
+
+    Raises:
+        AllMaskedError: if any row's first seq_lens_kv[b] entries are all False.
+    """
+    batch = mask.shape[0]
+    for b in range(batch):
+        n = int(seq_lens_kv[b].item())
+        if n == 0:
+            continue
+        if not bool(mask[b, :n].any()):
+            raise AllMaskedError(
+                f"Query row {b} has no unmasked positions in its first {n} keys "
+                "(softmax would produce NaN). Every query needs at least one "
+                "shared or own-private page in its block table."
+            )
 
 
 def patch_vllm_block_manager(
@@ -237,6 +288,12 @@ def generate_vllm_kernel_patch() -> str:
     Returns a unified diff string that can be applied to vLLM's
     attention_kernels.cu to add TSAM type masking.
     """
+    # The branch is positioned AFTER `float qk = 0.0f;` so qk is in scope.
+    # We use -INFINITY (not -FLT_MAX) for IEEE 754 alignment: exp(-inf) = +0
+    # exactly per IEEE 754 §6.1, matching the Python reference which uses
+    # torch.where(mask, scores, float("-inf")). With -FLT_MAX, exp(-FLT_MAX)
+    # is denormal/subnormal but not exactly zero on some hardware, which would
+    # break the structural-zero proof.
     return """--- a/csrc/attention/attention_kernels.cu
 +++ b/csrc/attention/attention_kernels.cu
 @@ -1,5 +1,8 @@
@@ -244,7 +301,7 @@ def generate_vllm_kernel_patch() -> str:
  // Modified for TSAM: Typed Serving — Tenant-Scoped Attention Masking
 +//
 +// TSAM adds a per-page type check to enforce tenant isolation.
-+// Cross-tenant PRIVATE pages are masked to -inf before softmax.
++// Cross-tenant PRIVATE pages are masked to -INFINITY before softmax.
 
  template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS>
  __global__ void paged_attention_v1_kernel(
@@ -259,20 +316,27 @@ def generate_vllm_kernel_patch() -> str:
      const float scale) {
 
    const int seq_idx = blockIdx.x;
-@@ -45,6 +51,15 @@
+@@ -45,7 +51,18 @@
        const int physical_block_id = block_table[logical_block_idx];
        const scalar_t* k_ptr = k_cache + physical_block_id * kv_block_stride;
 
+-      // Compute attention score: q . k
+       float qk = 0.0f;
++
 +      // === TSAM TYPE MASK ===
-+      // Check page type: block cross-tenant PRIVATE pages.
-+      // This is a warp-uniform branch (all threads process the same page).
-+      if (page_type[physical_block_id] == 0  // PRIVATE
++      // Block cross-tenant PRIVATE pages. Warp-uniform branch (all threads in
++      // the warp see the same page metadata, so no warp divergence). We use
++      // -INFINITY rather than -FLT_MAX so that exp(qk) == +0 exactly per
++      // IEEE 754 §6.1, matching the Python reference (torch float("-inf")).
++      // Caller must guarantee at least one unmasked key per query row;
++      // otherwise softmax denominator is zero. See AllMaskedError in
++      // tsam.integration.vllm_patch.assert_any_unmasked.
++      if (page_type[physical_block_id] == 0  /* PRIVATE */
 +          && tenant_id[physical_block_id] != current_tenant_id) {
-+        qk = -FLT_MAX;  // Mask out cross-tenant private keys
-+        continue;        // Skip to next key position
++        qk = -INFINITY;
++        continue;  // skip dot-product; remaining loop iterations skip too
 +      }
 +
-       // Compute attention score: q . k
-       float qk = 0.0f;
++      // Compute attention score: q . k
        for (int d = 0; d < HEAD_SIZE; d++) {
 """

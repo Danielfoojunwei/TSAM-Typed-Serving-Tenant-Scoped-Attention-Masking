@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tsam"
 version = "0.1.0"
-description = "TSAM: Typed Serving — Tenant-Scoped Attention Masking for Multi-Tenant LLM Serving"
+description = "TSAM: Tenant-Scoped Attention Masking for isolated multi-tenant LLM serving via PagedAttention"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}

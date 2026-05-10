@@ -3,6 +3,10 @@ Experiment runners — orchestrates the full experimental protocol (Experiments 
 
 Each experiment function runs the complete protocol, collects results,
 and returns structured output for analysis and plotting.
+
+IMPORTANT: Experiment 1 measures *actual* mutual information between
+attention outputs and private KV content using the KSG estimator, not
+merely boolean mask correctness.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from tsam.benchmarks.scalability import ScalabilityBenchmark, ScalabilityResult
 from tsam.benchmarks.throughput import ThroughputBenchmark, ThroughputResult
 from tsam.benchmarks.prefix_sharing import PrefixSharingBenchmark, PrefixSharingResult
 from tsam.evaluation.collision_attack import CollisionAttackSimulator, CollisionAttackResult
+from tsam.evaluation.leakage import MutualInformationEstimator, LeakageEstimator
 from tsam.dai.timing_dfa import TimingDFA, TimingDFAConfig, TimingDFAMiddleware
 
 
@@ -44,8 +49,16 @@ def run_experiment_1_isolation(
 ) -> Dict[str, Any]:
     """Experiment 1 — Isolation Correctness Verification.
 
-    Confirms I(output(q_i); KV_private(t_j)) = 0 under TSAM by running
-    synthetic leakage tests with cross-tenant attention.
+    Measures I(output(q_i); KV_private(t_j)) using the KSG mutual information
+    estimator on actual attention outputs — not merely boolean mask checks.
+
+    Protocol:
+      1. Set up a mixed block table with shared + victim-private + attacker-private.
+      2. Run num_attack_queries with random queries from the attacker.
+      3. Collect TSAM outputs and vanilla (no-mask) outputs.
+      4. Measure MI between each set of outputs and the victim's private KV.
+      5. TSAM MI should be ~0; vanilla MI should be significantly > 0.
+      6. Also verify mask correctness as a sanity check (not the primary metric).
     """
     from tsam.core.block_manager import TypedBlockManager
     from tsam.attention.masking import generate_tsam_mask
@@ -72,30 +85,51 @@ def run_experiment_1_isolation(
     attacker_pages = bm.allocate_private(tenant=1, count=private_blocks_per_tenant)
     attacker_ids = [p.block_id for p in attacker_pages]
 
-    # KV cache with distinct content for victim's private blocks.
-    key_cache = torch.randn(
-        total_blocks, page_size, num_kv_heads, head_dim, device=device
-    )
-    value_cache = torch.randn(
-        total_blocks, page_size, num_kv_heads, head_dim, device=device
-    )
-
-    # Put distinctive content in victim's blocks (simulating private prompt KV).
-    for blk in victim_ids:
-        key_cache[blk] = torch.ones(page_size, num_kv_heads, head_dim) * 42.0
-        value_cache[blk] = torch.ones(page_size, num_kv_heads, head_dim) * 42.0
-
     # Attacker's block table includes shared + victim + attacker blocks
     # (worst case: attacker can address victim's physical blocks).
     mixed_bt = shared_ids + victim_ids + attacker_ids
     block_table = torch.tensor(mixed_bt, dtype=torch.int32, device=device)
     seq_len_kv = len(mixed_bt) * page_size
 
-    # Run attack queries from attacker (tenant 1).
-    leakage_bits = []
+    # Collect outputs from both TSAM-protected and vanilla (unmasked) attention.
+    #
+    # Methodology: For each query, we compute the output twice with two
+    # different victim KV contents (KV_A and KV_B). If the defense works,
+    # the output should be identical regardless of the victim's private KV.
+    # If it doesn't work (vanilla), the output changes.
+    #
+    # Metrics:
+    #   1. Functional independence: ||output(KV_A) - output(KV_B)||
+    #      Should be 0.0 for TSAM, > 0 for vanilla.
+    #   2. MI estimation: I(output; victim_kv) via KSG estimator.
+    #   3. Mask correctness: sanity check on boolean mask.
+    tsam_outputs: List[np.ndarray] = []
+    vanilla_outputs: List[np.ndarray] = []
+    victim_kv_samples: List[np.ndarray] = []
+    tsam_diffs: List[float] = []     # ||output_A - output_B|| under TSAM
+    vanilla_diffs: List[float] = []  # ||output_A - output_B|| without TSAM
+    mask_all_correct = True
+
     for q in range(num_attack_queries):
+        # Base KV cache (shared + attacker content fixed).
+        key_cache = torch.randn(
+            total_blocks, page_size, num_kv_heads, head_dim, device=device
+        )
+        value_cache = torch.randn(
+            total_blocks, page_size, num_kv_heads, head_dim, device=device
+        )
+
+        # Record the victim's private KV (version A) for MI estimation.
+        victim_kv_flat = []
+        for blk in victim_ids:
+            victim_kv_flat.append(key_cache[blk].detach().cpu().numpy().flatten())
+        victim_kv_samples.append(np.concatenate(victim_kv_flat))
+
+        # Same query used for all comparisons in this trial.
         query = torch.randn(num_heads, head_dim, device=device)
-        output_tsam = tsam_paged_attention(
+
+        # --- Compute outputs with victim KV version A ---
+        output_tsam_a = tsam_paged_attention(
             query=query,
             key_cache=key_cache,
             value_cache=value_cache,
@@ -106,9 +140,9 @@ def run_experiment_1_isolation(
             page_size=page_size,
             seq_len_kv=seq_len_kv,
         )
+        tsam_outputs.append(output_tsam_a.detach().cpu().numpy().flatten())
 
-        # Run without TSAM (vanilla — attacker sees everything).
-        # For vanilla, compute attention without masking.
+        # Vanilla output version A (no TSAM masking — attacker sees everything).
         scale = 1.0 / (head_dim ** 0.5)
         all_keys = key_cache[block_table].reshape(-1, num_kv_heads, head_dim)[:seq_len_kv]
         all_values = value_cache[block_table].reshape(-1, num_kv_heads, head_dim)[:seq_len_kv]
@@ -122,17 +156,56 @@ def run_experiment_1_isolation(
             )
         q_expanded = query.unsqueeze(1)  # (num_heads, 1, head_dim)
         k_t = all_keys.permute(1, 2, 0)
-        scores_vanilla = torch.bmm(q_expanded, k_t) * scale
-        weights_vanilla = torch.nn.functional.softmax(scores_vanilla, dim=-1)
+        scores_vanilla_a = torch.bmm(q_expanded, k_t) * scale
+        weights_vanilla_a = torch.nn.functional.softmax(scores_vanilla_a, dim=-1)
         v_t = all_values.permute(1, 0, 2)
-        output_vanilla = torch.bmm(weights_vanilla, v_t).squeeze(1)
+        output_vanilla_a = torch.bmm(weights_vanilla_a, v_t).squeeze(1)
+        vanilla_outputs.append(output_vanilla_a.detach().cpu().numpy().flatten())
 
-        # Measure: does TSAM output contain information about victim's blocks?
-        # Victim's distinctive content is 42.0. If TSAM works, output should
-        # be independent of these blocks.
+        # --- Compute outputs with victim KV version B (different random content) ---
+        # Replace only the victim's blocks with fresh random data.
+        key_cache_b = key_cache.clone()
+        value_cache_b = value_cache.clone()
+        for blk in victim_ids:
+            key_cache_b[blk] = torch.randn(page_size, num_kv_heads, head_dim, device=device)
+            value_cache_b[blk] = torch.randn(page_size, num_kv_heads, head_dim, device=device)
+
+        output_tsam_b = tsam_paged_attention(
+            query=query,
+            key_cache=key_cache_b,
+            value_cache=value_cache_b,
+            block_table=block_table,
+            page_type=bm.page_type,
+            tenant_id_meta=bm.tenant_id,
+            query_tenant=1,
+            page_size=page_size,
+            seq_len_kv=seq_len_kv,
+        )
+
+        all_keys_b = key_cache_b[block_table].reshape(-1, num_kv_heads, head_dim)[:seq_len_kv]
+        all_values_b = value_cache_b[block_table].reshape(-1, num_kv_heads, head_dim)[:seq_len_kv]
+        if num_groups > 1:
+            all_keys_b = all_keys_b.unsqueeze(2).expand(-1, -1, num_groups, -1).reshape(
+                seq_len_kv, num_heads, head_dim
+            )
+            all_values_b = all_values_b.unsqueeze(2).expand(-1, -1, num_groups, -1).reshape(
+                seq_len_kv, num_heads, head_dim
+            )
+        scores_vanilla_b = torch.bmm(q_expanded, all_keys_b.permute(1, 2, 0)) * scale
+        weights_vanilla_b = torch.nn.functional.softmax(scores_vanilla_b, dim=-1)
+        output_vanilla_b = torch.bmm(weights_vanilla_b, all_values_b.permute(1, 0, 2)).squeeze(1)
+
+        # Functional independence: measure how much the output changes
+        # when the victim's private KV changes (A -> B).
+        tsam_diff = float(torch.norm(output_tsam_a - output_tsam_b).item())
+        vanilla_diff = float(torch.norm(output_vanilla_a - output_vanilla_b).item())
+        tsam_diffs.append(tsam_diff)
+        vanilla_diffs.append(vanilla_diff)
+
+        # --- Sanity check: verify mask blocks victim positions ---
         victim_start = shared_blocks * page_size
         victim_end = victim_start + private_blocks_per_tenant * page_size
-        victim_weights_tsam = generate_tsam_mask(
+        mask_result = generate_tsam_mask(
             block_table=block_table,
             page_type=bm.page_type,
             tenant_id=bm.tenant_id,
@@ -141,19 +214,66 @@ def run_experiment_1_isolation(
             seq_len_kv=seq_len_kv,
             device=device,
         )
-        # Verify all victim positions are blocked.
-        victim_mask = victim_weights_tsam.mask[victim_start:victim_end]
-        bits_leaked = 0.0 if not victim_mask.any() else float("inf")
-        leakage_bits.append(bits_leaked)
+        victim_mask = mask_result.mask[victim_start:victim_end]
+        if victim_mask.any():
+            mask_all_correct = False
+
+    # --- Mutual Information measurement ---
+    # Each query used a different random victim KV, so victim_kv_samples
+    # varies across queries. If the output depends on the victim's KV,
+    # MI(output; victim_kv) > 0. If TSAM blocks it, MI should be ~0.
+    tsam_outputs_arr = np.array(tsam_outputs)         # (num_queries, d_out)
+    vanilla_outputs_arr = np.array(vanilla_outputs)    # (num_queries, d_out)
+    victim_kv_arr = np.array(victim_kv_samples)        # (num_queries, d_private)
+
+    # KSG estimator works best in low dimensions. Use PCA-like truncation:
+    # take only the first D dimensions from each array to keep estimation
+    # tractable and numerically stable. D = min(32, actual dims).
+    d_trunc = min(32, tsam_outputs_arr.shape[1], victim_kv_arr.shape[1])
+    tsam_for_mi = tsam_outputs_arr[:, :d_trunc]
+    vanilla_for_mi = vanilla_outputs_arr[:, :d_trunc]
+    private_for_mi = victim_kv_arr[:, :d_trunc]
+
+    mi_estimator = MutualInformationEstimator(k=3)
+
+    # MI(TSAM_output; victim_private) — should be ~0.
+    mi_tsam_bits, mi_tsam_std = mi_estimator.estimate_bits(
+        tsam_for_mi, private_for_mi
+    )
+
+    # MI(vanilla_output; victim_private) — should be significantly > 0.
+    mi_vanilla_bits, mi_vanilla_std = mi_estimator.estimate_bits(
+        vanilla_for_mi, private_for_mi
+    )
+
+    # --- Functional Independence summary ---
+    mean_tsam_diff = float(np.mean(tsam_diffs))
+    mean_vanilla_diff = float(np.mean(vanilla_diffs))
+    max_tsam_diff = float(np.max(tsam_diffs))
 
     results = {
         "defense": "TSAM",
         "num_attack_queries": num_attack_queries,
-        "bits_per_query": leakage_bits,
-        "mean_bits_per_query": float(np.mean(leakage_bits)),
-        "max_bits_per_query": float(np.max(leakage_bits)),
-        "all_zero_leakage": all(b == 0.0 for b in leakage_bits),
-        "pass": all(b == 0.0 for b in leakage_bits),
+        # Primary metric 1: Functional independence test.
+        # If TSAM works, changing the victim's KV should have ZERO effect
+        # on the attacker's output. Vanilla output should change significantly.
+        "tsam_mean_output_diff": mean_tsam_diff,
+        "tsam_max_output_diff": max_tsam_diff,
+        "vanilla_mean_output_diff": mean_vanilla_diff,
+        "functional_independence": mean_tsam_diff == 0.0,
+        # Primary metric 2: MI-based leakage measurement.
+        "tsam_mi_bits": mi_tsam_bits,
+        "tsam_mi_std_bits": mi_tsam_std,
+        "vanilla_mi_bits": mi_vanilla_bits,
+        "vanilla_mi_std_bits": mi_vanilla_std,
+        "mi_reduction_pct": (
+            (1.0 - mi_tsam_bits / max(mi_vanilla_bits, 1e-10)) * 100.0
+            if mi_vanilla_bits > 0 else 100.0
+        ),
+        # Sanity check: boolean mask correctness (necessary but not sufficient).
+        "mask_all_correct": mask_all_correct,
+        # Overall pass requires functional independence AND mask correctness.
+        "pass": mask_all_correct and max_tsam_diff == 0.0,
     }
 
     return results
