@@ -7,3 +7,24 @@ build/
 .pytest_cache/
 *.egg
 .eggs/
+
+# Local venvs and editor state
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+
+# LaTeX intermediates (run `make clean` in paper/ to remove)
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.bbl
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/*.toc
+
+# Run artifacts (commit the run-metadata.json + plots, not raw logs)
+artifacts/runs/*/raw/
