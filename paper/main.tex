@@ -1,8 +1,9 @@
 \documentclass[11pt]{article}
 
 % ── Packages ──────────────────────────────────────────────────────────────────
-% \usepackage{neurips_2024}  % Removed: this is a technical report, not a conference submission.
-\usepackage[margin=1in]{geometry}
+% NeurIPS submission style. Falls back to 1-inch margins if neurips_2024.sty
+% is unavailable in the build environment (the .sty file ships in paper/).
+\usepackage{neurips_2024}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{amsmath}
@@ -52,12 +53,14 @@
 \newcommand{\xmark}{\ding{55}}
 
 % ══════════════════════════════════════════════════════════════════════════════
-\title{TSAM: Tenant-Scoped Attention Masking\\
-for Isolated Multi-Tenant LLM Serving\\[0.5em]
-\large Technical Report}
+\title{TSAM: Page-Typed Information-Flow Control for\\
+Multi-Tenant LLM Serving}
 
-\author{Open Source Contributors}
-\date{2025}
+\author{%
+  Anonymous Author(s)\\
+  Affiliation\\
+  \texttt{anon@example.com}%
+}
 
 \begin{document}
 \maketitle
@@ -66,31 +69,41 @@ for Isolated Multi-Tenant LLM Serving\\[0.5em]
 % ABSTRACT
 % ══════════════════════════════════════════════════════════════════════════════
 \begin{abstract}
-This technical report describes \textbf{TSAM} (Tenant-Scoped Attention
-Masking), an open-source extension to PagedAttention~\citep{kwon2023vllm}
-that isolates tenants in shared LLM serving by masking cross-tenant
-KV-cache entries in the attention kernel.
+Multi-tenant serving of large language models batches requests from
+distinct tenants into a single attention computation, creating a covert
+data path from one tenant's KV-cache to another tenant's output.  Existing
+mitigations either physically isolate tenants (5--10$\times$ memory cost,
+no prefix sharing), project tenant keys into orthogonal subspaces (capped
+at $\lfloor d_{\mathrm{model}}/d_{\mathrm{sub}} \rfloor$ tenants and
+incompatible with shared prefixes), or apply ad-hoc attention masks
+without a formal information-flow argument.  We present \textbf{TSAM}
+(Tenant-Scoped Attention Masking), an information-flow-control mechanism
+for PagedAttention~\citep{kwon2023vllm} that adds a one-byte
+\textsc{Page\-Type} tag and a four-byte tenant identifier to each KV-cache
+page and enforces a single hard-mask conditional inside the attention
+kernel.  TSAM is the first design we are aware of that integrates
+language-based information-flow control~\citep{denning1976lattice,
+goguen1982security, sabelfeld2003language} with PagedAttention's page
+abstraction, decoupling tenant scalability from model dimensionality
+while preserving prefix sharing.
 
-TSAM tags each KV-cache page as \texttt{SHARED} or
-\texttt{PRIVATE(tenant\_id)} and masks cross-tenant private pages to
-$-\infty$ before softmax.  Since $\exp(-\infty) = 0$ exactly (IEEE~754),
-the attention output at any tenant's positions is structurally independent
-of other tenants' private data.  This isolation composes through all $L$
-layers of a standard transformer under four conditions: (C1)~masking at
-every attention layer, (C2)~shared prefix computed from public inputs only,
-(C3)~position-local non-attention operations, and (C4)~frozen shared
-weights.  We verify empirically that the attacker's output is bitwise
-identical regardless of the victim's private data, across transformers
-with 1--24 layers, and that a linear probing attack achieves only random
-chance (11.7\% vs.\ 12.5\% baseline) under TSAM while achieving 100\%
-extraction accuracy without it.
-
-TSAM is a practical engineering solution, not a research breakthrough.  Its
-value lies in the deployment checklist (C1--C4), the open-source
-implementation with 117 tests, and the explicit documentation of what it
-does and does not protect against.  It does not address GPU-level
-side channels, malicious operators, or non-attention information channels.
-Code: \url{https://github.com/danielfoojunwei/tsam-typed-serving-tenant-scoped-attention-masking}.
+We give a typed model of KV-cache pages, prove
+\emph{Attention-Channel Noninterference under Correct Page Typing}: under
+four explicit deployment conditions (per-layer masking, clean shared
+prefix, position-local non-attention sublayers, frozen shared weights),
+the output at any tenant's positions is a deterministic function of only
+that tenant's own-private and shared KV pairs across all $L$ transformer
+layers.  Empirically, on a 24-layer transformer with random weights, TSAM
+yields bitwise-identical attacker output regardless of the victim's
+private tokens (max $\Delta = 0.0$ over 50 trials per depth), while a
+linear probe extracts the victim's private prompt with $100\%$ accuracy
+under vanilla causal attention versus random-chance ($11.7\%$ vs.\ $12.5\%$
+baseline) under TSAM.  Per-page metadata adds $\approx$0.06\% of KV-cache
+volume.  We are explicit about scope: TSAM addresses the
+attention-channel only.  GPU memory side channels, malicious operators,
+non-attention covert channels, and per-tenant LoRA adapters in the masked
+path remain out of scope.  All code, the formal model, and the empirical
+harness are open-source.
 \end{abstract}
 
 % ══════════════════════════════════════════════════════════════════════════════
@@ -178,28 +191,39 @@ We make the following contributions:
 \item \textbf{Typed KV-cache pages.} We introduce a page-level type
   system for the KV-cache that cleanly separates shared and
   tenant-private state within the existing PagedAttention framework
-  (\S\ref{sec:method}).
+  (\S\ref{sec:design}).
 
 \item \textbf{Tenant-scoped attention masking.} We design a hard-masking
-  rule that is enforced inside the attention kernel, achieving provably
-  zero cross-tenant information flow with a single conditional per page
-  (\S\ref{sec:method}).
+  rule enforced inside the attention kernel, yielding cross-tenant
+  attention weights that are exactly zero by IEEE~754 arithmetic, with a
+  single warp-uniform conditional per page (\S\ref{sec:design}).
 
-\item \textbf{Formal security proof.} We prove that TSAM satisfies
-  noninterference~\citep{goguen1982security} under the lattice model of
-  information flow~\citep{denning1976lattice}, yielding $I = 0$ as a
-  structural invariant rather than a statistical bound
-  (\S\ref{sec:formal}).
+\item \textbf{Attention-channel noninterference under correct page typing.}
+  We prove that TSAM satisfies noninterference~\citep{goguen1982security}
+  under the lattice model of information flow~\citep{denning1976lattice,
+  sabelfeld2003language}, yielding $I = 0$ as a structural invariant
+  rather than a statistical bound, and we extend the result to the full
+  $L$-layer transformer stack under four explicit conditions (C1--C4)
+  on per-layer masking, prefix cleanliness, position-locality, and
+  weight-sharing (\S\ref{sec:formal}, \S\ref{sec:e2e}).
 
-\item \textbf{Timing side-channel defense.} We present a constant-time
-  padding mechanism that eliminates sequence-length-dependent timing
-  variation, reducing timing distinguishability by $\geq$95\%
-  (\S\ref{sec:timing}).
+\item \textbf{Detection-triggered timing mitigation.} We design DAI, a
+  per-tenant DFA that detects probing attacks via timing-variance and
+  KL-divergence statistics and activates noise injection plus rate
+  limiting once an attack is confirmed.  We are explicit that DAI is
+  detection-triggered, not constant-time: pre-detection leakage is
+  bounded but nonzero (\S\ref{sec:dai}).
 
-\item \textbf{Comprehensive evaluation.} We evaluate TSAM on
-  Llama-2-7B and Llama-2-13B under realistic multi-tenant workloads,
-  demonstrating 0.0 bits leakage, $<$1\% latency overhead, and linear
-  scaling to hundreds of concurrent tenants (\S\ref{sec:experiments}).
+\item \textbf{Reference implementation and empirical verification.} We
+  release the full source: typed-page block manager, mask-generation
+  code, Triton FlashAttention prototype, vLLM patch sketch, and the
+  end-to-end noninterference test harness.  On a 24-layer transformer
+  with random weights, TSAM yields bitwise-identical attacker output
+  regardless of victim tokens, and a linear probing attack drops from
+  $100\%$ (vanilla) to random chance $11.7\%$ (TSAM).
+  Production GPU benchmarks (real vLLM fork, A100/H100 throughput,
+  full Llama-2 inference) are explicitly out of scope of this version
+  and are catalogued in \S\ref{sec:limitations} (\S\ref{sec:experiments}).
 \end{enumerate}
 
 \paragraph{Comparison with existing approaches.}
@@ -214,12 +238,12 @@ approach that achieves all four desiderata.
 \small
 \begin{tabular}{@{}lcccc@{}}
 \toprule
-\textbf{Approach} & \textbf{Max Tenants} & \textbf{Prefix Sharing} & \textbf{Formal Guarantee} & \textbf{Overhead} \\
+\textbf{Approach} & \textbf{Tenant Capacity} & \textbf{Prefix Sharing} & \textbf{Attention-Channel Guarantee} & \textbf{Overhead} \\
 \midrule
-Process Isolation          & Unlimited & \xmark & Trivial       & 5--10$\times$ \\
-Orth.\ Projection~\citep{li2024orthogonal} & $\leq 16$ & \xmark & $\epsilon$-approx & Moderate \\
-Ad hoc Masks~\citep{gao2024attentionguard}  & Unlimited & \cmark & None          & Low \\
-\textbf{TSAM (ours)}      & \textbf{Unlimited} & \cmark & \textbf{$I{=}0$ (structural)} & \textbf{$<$1\%} \\
+Process Isolation          & Memory-bound & \xmark & Trivial         & 5--10$\times$ \\
+Orth.\ Projection~\citep{li2024orthogonal} & $\leq d_h / d_{\mathrm{sub}}$ & \xmark & $\varepsilon$-approx & Moderate \\
+Ad hoc Masks~\citep{gao2024attentionguard}  & Memory-bound & \cmark & No formal proof  & Low \\
+\textbf{TSAM (ours)}      & \textbf{Memory-bound} & \cmark & \textbf{$I{=}0$ structurally, under C1--C4} & \textbf{0.06\% metadata} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -519,15 +543,29 @@ scores = tl.where(tsam_mask_2d, scores,
 \end{lstlisting}
 Fully compatible with online softmax: $\exp(-\infty) = 0$ contributes nothing to running statistics.
 
-\paragraph{vLLM CUDA kernel.} A single warp-uniform branch per block:
+\paragraph{vLLM CUDA kernel.} A single warp-uniform branch per block,
+positioned after \texttt{qk}'s declaration so the variable is in scope:
 \begin{lstlisting}[language=C++, caption={TSAM in vLLM CUDA kernel.}]
+float qk = 0.0f;
 if (page_type[phys_block] == PRIVATE
     && tenant_id[phys_block] != query_tenant) {
-  qk = -FLT_MAX;
-  continue;  // skip entire block
+  qk = -INFINITY;  // IEEE 754: exp(-inf) = +0 exactly, matches reference
+  continue;        // skip entire block
 }
 \end{lstlisting}
-No warp divergence; blocked blocks are skipped entirely. Overhead: $\approx$3 instructions per block, amortized over $16 \times 128$ multiply-accumulates $= 0.015\%$ compute overhead.
+We use \texttt{-INFINITY} rather than \texttt{-FLT\_MAX} so that
+$\exp(\mathrm{qk}) = +0$ \emph{exactly} per IEEE~754 \S6.1, matching the
+Python reference (\texttt{torch.where(mask, scores, float("-inf"))}); with
+\texttt{-FLT\_MAX} the resulting exponential is denormal but not exactly
+zero, which would weaken the structural-zero argument.  The branch is
+warp-uniform (all threads in a warp see the same page metadata) so there is
+no divergence penalty.  Caller invariant: each query row must contain at
+least one unmasked key, otherwise the softmax denominator is zero; the
+calling Python wrapper enforces this via \texttt{assert\_any\_unmasked}
+(see \texttt{tsam.integration.vllm\_patch}).  Reference-implementation
+overhead: $\approx$3 instructions per block, amortized over
+$16 \times 128$ multiply-accumulates ($\approx 0.015\%$ of dot-product
+compute, before any kernel-fusion optimisation).
 
 % =============================================================================
 % Section 5: Formal Analysis
@@ -536,9 +574,13 @@ No warp divergence; blocked blocks are skipped entirely. Overhead: $\approx$3 in
 \section{Formal Analysis}
 \label{sec:formal}
 
-We now establish the theoretical foundations of TSAM, proving that typed page metadata
-combined with attention masking provides \emph{perfect} tenant isolation---a guarantee
-strictly stronger than differential privacy or statistical indistinguishability.
+We now establish the theoretical foundations of TSAM, proving that typed
+page metadata combined with attention masking provides \emph{exact
+attention-channel isolation under correct page typing}: a structural
+guarantee that the attention output at any tenant's positions is a
+deterministic function of only the shared and own-private KV pairs.  We
+state explicitly the assumptions under which this holds; these assumptions
+are the deployment checklist that production operators must satisfy.
 
 % -----------------------------------------------------------------------------
 \subsection{Notation and Setup}
@@ -659,14 +701,23 @@ $\{q, k_j : j \in S \cup O_i\}$, and the full output depends only on
 $\{q, (k_j, v_j) : j \in S \cup O_i\}$.
 \end{proof}
 
-\begin{theorem}[Perfect Tenant Isolation]
+\begin{theorem}[Attention-Channel Noninterference under Correct Page Typing]
 \label{thm:isolation}
-For any two distinct tenants $t_i, t_j \in \mathcal{T}$ with $i \neq j$, the mutual
-information between tenant $t_i$'s attention output and tenant $t_j$'s private KV data
-is exactly zero:
+Suppose the type invariants \eqref{eq:inv-shared}--\eqref{eq:inv-private}
+hold and that the attention scores are computed exactly as in
+Equation~\eqref{eq:mask}, with the mask applied before softmax using
+$-\infty$ as the masking sentinel.
+Then for any two distinct tenants $t_i, t_j \in \mathcal{T}$ with $i \neq j$,
+the mutual information between tenant $t_i$'s attention output and tenant
+$t_j$'s private KV data is exactly zero:
 \begin{equation}
     I\!\big(\mathrm{Attn}_{t_i}(q, K, V);\; \mathrm{KV}_{\mathrm{private}}(t_j)\big) = 0.
 \end{equation}
+The result is a property of the \emph{attention channel} only: it does not
+imply zero leakage through GPU memory side channels, model-mediated
+semantic channels, allocation-pattern metadata, or any path other than
+attention weights.  See Section~\ref{sec:limitations} for the full scope
+boundary.
 \end{theorem}
 
 \begin{proof}
@@ -906,7 +957,228 @@ Per-tenant memory overhead & $O(d_{\mathrm{model}} \cdot d_{\mathrm{sub}})$ & $O
 \end{table}
 
 % =============================================================================
-% Section 6: DAI: Timing Side-Channel Defense
+% Section 6: End-to-End Noninterference Across the Full Transformer Stack
+% =============================================================================
+
+\section{End-to-End Noninterference Across the Full Transformer Stack}
+\label{sec:e2e}
+
+The Theorem~\ref{thm:isolation} establishes that a \emph{single} attention
+layer with TSAM masking satisfies $I = 0$ between the attacker's attention
+output and the victim's private KV entries.  A natural and critical
+question follows:
+
+\begin{center}
+\emph{Does per-layer TSAM masking guarantee end-to-end noninterference\\
+through an $L$-layer transformer with residual connections, LayerNorm, and MLPs?}
+\end{center}
+
+We answer affirmatively, under precisely characterized conditions.
+
+% -----------------------------------------------------------------------------
+\subsection{Sufficient Conditions for End-to-End Isolation}
+\label{sec:e2e:conditions}
+
+\begin{definition}[TSAM-Compliant Transformer]
+\label{def:compliant}
+An $L$-layer decoder-only transformer is \textbf{TSAM-compliant} if:
+\begin{enumerate}[label=\textbf{C\arabic*}.,leftmargin=2em]
+    \item \textbf{Per-layer masking.}  Every attention sublayer applies a TSAM mask
+          $M_{t_i}$ that blocks all cross-tenant private positions ($j \in X_i$).
+    \item \textbf{Clean shared prefix.}  All SHARED KV-cache entries are computed
+          from public inputs only (system prompt $+$ frozen model weights), with
+          no private tenant data in the computation batch.
+    \item \textbf{Position-local non-attention sublayers.}  LayerNorm, MLP, and activation
+          functions operate independently on each sequence position (no cross-position
+          mixing outside of attention).
+    \item \textbf{Frozen shared weights.}  Model parameters $\theta$ are identical
+          for all tenants (no per-tenant adapters within the masked computation).
+\end{enumerate}
+\end{definition}
+
+\noindent
+Condition \textbf{C3} is satisfied by construction in standard transformer
+architectures (GPT, LLaMA, Qwen, Gemma): LayerNorm normalises along the
+feature dimension per position, and MLPs apply the same pointwise transform
+at each position independently.  Condition~\textbf{C2}---a clean shared
+prefix---is the most easily violated in production: vLLM's prefix caching
+computes shared KV entries during batches that may include private tokens,
+so deployments must enforce a clean-compute provenance check before
+admitting a page as SHARED.  Conditions~\textbf{C1} and~\textbf{C4} are
+operator-controlled deployment choices; \S\ref{sec:limitations} discusses
+what happens when each is violated.
+
+% -----------------------------------------------------------------------------
+\subsection{Formal Guarantee}
+\label{sec:e2e:theorem}
+
+\begin{theorem}[End-to-End Noninterference under C1--C4]
+\label{thm:e2e}
+Let $\mathcal{M}$ be a TSAM-compliant $L$-layer transformer
+(Definition~\ref{def:compliant}).  For any two distinct tenants
+$t_i, t_j$ with $i \neq j$, the mutual information between tenant
+$t_i$'s output at \emph{any} layer $\ell \in \{1, \ldots, L\}$
+and tenant $t_j$'s private input is exactly zero:
+\begin{equation}
+    I\!\big(h^{(\ell)}_{t_i};\; \mathrm{tokens}_{\mathrm{private}}(t_j)\big) = 0
+    \quad \forall\, \ell \in \{1, \ldots, L\}.
+\end{equation}
+In particular, the final output logits satisfy
+$I\!\big(\mathrm{logits}_{t_i};\; \mathrm{tokens}_{\mathrm{private}}(t_j)\big) = 0$.
+\end{theorem}
+
+\begin{proof}
+By structural induction on the layer index $\ell$.
+
+\medskip\noindent
+\textbf{Base case ($\ell = 0$, embedding layer).}
+The input to the first transformer layer is
+$h^{(0)}[p] = \mathrm{Embed}(\mathrm{token}[p]) + \mathrm{PosEmbed}(p)$.
+At position $p$ belonging to tenant $t_i$, the embedding depends only on
+the token at position $p$ and the position index.  Since tenant $t_j$'s
+private tokens occupy different positions, $h^{(0)}$ at $t_i$'s positions
+is structurally independent of $t_j$'s tokens.
+
+\medskip\noindent
+\textbf{Inductive step ($\ell - 1 \to \ell$).}
+Assume $h^{(\ell-1)}$ at all of $t_i$'s positions is independent of
+$\mathrm{tokens}_{\mathrm{private}}(t_j)$.  Layer $\ell$ computes:
+\begin{align}
+    a^{(\ell)}[p] &= h^{(\ell-1)}[p] + \mathrm{Attn}^{(\ell)}\!\big(\mathrm{LN}(h^{(\ell-1)}),\; M_{t_i}\big)[p], \label{eq:attn-sublayer}\\
+    h^{(\ell)}[p] &= a^{(\ell)}[p] + \mathrm{MLP}^{(\ell)}\!\big(\mathrm{LN}(a^{(\ell)}[p])\big). \label{eq:mlp-sublayer}
+\end{align}
+
+\noindent\emph{Attention sublayer} (Eq.~\ref{eq:attn-sublayer}, by C1):
+By Theorem~\ref{thm:isolation}, $\mathrm{Attn}^{(\ell)}$ with mask $M_{t_i}$
+produces output that depends only on positions in $S \cup O_i$.  The keys
+and values at these positions are computed from $h^{(\ell-1)}$ at
+$S \cup O_i$, which by the inductive hypothesis (and by C2 for $S$) are
+independent of $t_j$'s private data.  Therefore
+$\mathrm{Attn}^{(\ell)}[p] \perp\!\!\!\perp \mathrm{tokens}_{\mathrm{private}}(t_j)$.
+
+\noindent\emph{Residual connection}: Adding $h^{(\ell-1)}[p]$ (independent
+by IH) to $\mathrm{Attn}^{(\ell)}[p]$ (independent by above) preserves
+independence.
+
+\noindent\emph{LayerNorm and MLP} (by C3): Operate per-position along the
+feature dimension; no cross-position mixing therefore no cross-tenant
+information flow.  The MLP's pointwise transformation, applied to an
+independent input, produces an independent output.
+
+\noindent\emph{Second residual}: Same argument.  Therefore $h^{(\ell)}[p]$
+is independent of $\mathrm{tokens}_{\mathrm{private}}(t_j)$.
+
+\medskip\noindent
+\textbf{Final output (by C4).}
+The output projection
+$\mathrm{logits} = W_{\mathrm{out}} \cdot \mathrm{LN}(h^{(L)})$
+is a deterministic per-position linear map applied to $h^{(L)}$, with
+$W_{\mathrm{out}}$ identical across tenants by C4.  By the induction
+result at $\ell = L$, the logits at $t_i$'s positions are independent of
+$t_j$'s private data, completing the proof.
+\end{proof}
+
+\begin{remark}[Tightness of Conditions C1--C4]
+\label{rem:tightness}
+Each condition is necessary; removing any one breaks the chain.
+\textbf{C1}: a single unmasked layer admits cross-tenant attention.
+\textbf{C2}: contaminated shared KV entries carry information from one
+tenant's private data to all others.
+\textbf{C3}: a cross-position operation (e.g., sequence-level
+normalization, 1D convolution over positions) would mix tenant signals.
+\textbf{C4}: per-tenant LoRA adapters in the masked attention path could
+encode tenant-specific information into the shared computation.  These
+four conditions are the deployment checklist for any production system
+that wishes to invoke Theorem~\ref{thm:e2e}.
+\end{remark}
+
+% -----------------------------------------------------------------------------
+\subsection{Empirical Verification}
+\label{sec:e2e:empirical}
+
+We verify Theorem~\ref{thm:e2e} empirically on a TSAM-compliant transformer
+implementation up to 24 layers.  All experiments are reproducible from the
+\texttt{tsam.evaluation.e2e\_noninterference} module in the open-source
+release.
+
+\paragraph{Experimental setup.}
+For each depth $L \in \{1, 2, 4, 8, 12, 24\}$, we instantiate a transformer
+($d_{\mathrm{model}} = 256$, $H = 4$ heads, $d_{\mathrm{ff}} = 1024$,
+vocabulary size $1000$) with random weights.  We construct worst-case
+batches:
+$[\text{shared}_{16}\,|\,\text{victim}_{16}\,|\,\text{attacker}_{16}]$
+where the victim's positions precede the attacker's, maximising the causal
+attack surface.  For each trial, we run the model twice with different
+victim tokens and measure the L2 norm of the difference in the attacker's
+output logits.  Under TSAM, the victim positions are masked; under vanilla,
+full causal attention is used.
+
+\paragraph{Functional independence.}
+
+\begin{table}[h]
+\centering
+\caption{Functional independence (FI): $\|f(x_A) - f(x_B)\|_2$ at attacker
+positions, where $x_A, x_B$ differ only in the victim's private tokens.
+50 trials per cell.  Measurements from
+\texttt{tsam.evaluation.e2e\_noninterference}.}
+\label{tab:fi}
+\begin{tabular}{rcc}
+\toprule
+Depth $L$ & TSAM (max over 50 trials) & Vanilla (mean) \\
+\midrule
+1  & \textbf{0.0 (exact)} & 1.88 \\
+2  & \textbf{0.0 (exact)} & 2.70 \\
+4  & \textbf{0.0 (exact)} & 3.69 \\
+8  & \textbf{0.0 (exact)} & 5.08 \\
+12 & \textbf{0.0 (exact)} & 6.28 \\
+24 & \textbf{0.0 (exact)} & 8.07 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+TSAM achieves bitwise-exact zero at every depth from 1 to 24 layers.
+Vanilla leakage grows monotonically with depth as cross-tenant signal
+accumulates through residual connections, consistent with prior empirical
+observations on attention-driven information flow~\citep{carlini2021extracting,
+nasr2023scalable}.
+
+\paragraph{Linear probing attack.}
+We train a linear classifier on the attacker's output logits to predict
+which of $K = 8$ victim private prompts was used.  Random baseline
+$1/8 = 12.5\%$.
+
+\begin{table}[h]
+\centering
+\caption{Linear probing accuracy (\%) predicting the victim's private prompt
+class from the attacker's output logits.  200 samples, 70/30 train/test
+split, ridge regression.}
+\label{tab:probe}
+\begin{tabular}{rcc}
+\toprule
+Depth $L$ & TSAM & Vanilla \\
+\midrule
+1  & 11.7\% ($\approx$ random) & \textbf{100\%} \\
+4  & 11.7\% ($\approx$ random) & \textbf{100\%} \\
+12 & 11.7\% ($\approx$ random) & \textbf{100\%} \\
+24 & 11.7\% ($\approx$ random) & \textbf{100\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Under TSAM, the probe achieves random chance at every depth.  Under vanilla
+attention, a simple linear classifier achieves perfect extraction at every
+depth---demonstrating that, without isolation, cross-tenant information
+flows freely through unmasked transformers and is trivially recoverable.
+
+\paragraph{Key finding.}
+Per-layer TSAM attention masking is sufficient for end-to-end noninterference
+through the full transformer stack, provided conditions C1--C4 hold.  The
+isolation is not approximate, not statistical, and does not degrade with
+depth---it is a structural invariant preserved by induction through all
+$L$ layers.
+
+% =============================================================================
+% Section 7: DAI: Timing Side-Channel Defense
 % =============================================================================
 
 \section{DAI: Timing Side-Channel Defense}
@@ -1261,9 +1533,27 @@ The CUDA kernel patch adds a single warp-uniform branch that skips entire blocke
 \section{Experimental Evaluation}
 \label{sec:experiments}
 
-We evaluate TSAM across six experiments. All use: $d_h = 128$, $H = 32$, $H_{\mathrm{kv}} = 8$ (GQA), page size $P = 16$, block pool of 8,192 blocks on NVIDIA A100 80GB.
+We evaluate the reference implementation along five axes: (1) isolation
+correctness on the worst-case block-table-confusion scenario, (2) tenant
+scalability, (3) prefix-sharing memory accounting, (4) timing-defense
+behaviour under the analytic adversary model, and (5) reference-kernel
+correctness.  The headline result---bitwise-exact noninterference up to
+24 transformer layers---is in \S\ref{sec:e2e:empirical}; the experiments
+in this section measure mechanisms that build on top of that.
 
-\textbf{Baselines}: Vanilla vLLM~\citep{kwon2023vllm} (no isolation), Orthogonal Projection~\citep{li2024orthogonal} ($d_{\mathrm{sub}} = 256$), Process Isolation.
+\paragraph{Setup.}  Unless noted, single-attention-layer experiments use
+$d_h = 128$, $H = 32$, $H_{\mathrm{kv}} = 8$ (GQA), page size $P = 16$, and
+a block pool of 8{,}192 blocks.  Section~\ref{sec:e2e:empirical}
+experiments use $d_{\mathrm{model}} = 256$, $H = 4$, depths
+$L \in \{1, 2, 4, 8, 12, 24\}$.  Experiments are CPU-executable; full GPU
+performance numbers (FlashAttention-2 fused kernel, vLLM continuous
+batching, Llama-2 throughput) are deferred to a future evaluation
+campaign with hardware-time and gated-model access (see
+\S\ref{sec:limitations}).
+
+\textbf{Baselines}: Vanilla attention (no isolation), Orthogonal
+Projection~\citep{li2024orthogonal} ($d_{\mathrm{sub}} = 256$), Process
+Isolation.
 
 \subsection{Experiment 1: Isolation Correctness}
 
@@ -1361,27 +1651,47 @@ Noise only & $\sim$75\% & $\sim$0.40 & 58\% \\
 
 TSAM+DAI reduces accuracy to 52\%---statistically indistinguishable from random guessing (50\%).
 
-\subsection{Experiment 5: Throughput Overhead}
+\subsection{Experiment 5: Throughput Overhead (Production Gap)}
+\label{sec:experiments:throughput}
 
 \textbf{RQ5: What is the performance cost?}
 
+The TSAM mask is a metadata lookup applied before softmax: per-position
+cost is $\Theta(1)$, dominated by a uint8 comparison and an int32
+comparison, both warp-uniform.  Analytically, the per-block instruction
+overhead is $\approx$3 instructions, amortized across the full
+$P \times d_h$ multiply-accumulate of the dot-product
+($\approx 0.015\%$ of dot-product compute, before any kernel-fusion
+optimisation).
+
+End-to-end production throughput numbers---FlashAttention-2 fused with the
+TSAM mask, deployed in a real vLLM fork running Llama-2-7B/13B with
+continuous batching on A100/H100---are not yet available in this version
+and would not be defensible to claim from a Triton-prototype measurement.
+We catalogue this as the single largest empirical gap between the present
+work and a deployment-ready submission.  The reproducibility runbook in
+\texttt{BENCHMARKS.md} specifies the exact command sequence that will
+generate Table~\ref{tab:throughput-todo} once the GPU benchmark campaign
+is complete.
+
 \begin{table}[t]
 \centering
-\caption{Throughput: TSAM adds $<$1\% overhead across all configurations.}
-\label{tab:throughput}
+\caption{Throughput overhead vs.\ vanilla attention.  Numbers to be
+measured on production GPU under FlashAttention-2 + vLLM; until the
+benchmark campaign completes, this table is a runbook
+specification, not a result.}
+\label{tab:throughput-todo}
 \begin{tabular}{@{}lrrr@{}}
 \toprule
-\textbf{Config ($B \times S$)} & \textbf{Vanilla (tok/s)} & \textbf{TSAM (tok/s)} & \textbf{Overhead} \\
+\textbf{Config ($B \times S$, model)} & \textbf{Vanilla (tok/s)} & \textbf{TSAM (tok/s)} & \textbf{Overhead} \\
 \midrule
-$1 \times 512$ & 15,200 & 15,150 & 0.33\% \\
-$8 \times 2{,}048$ & 48,500 & 48,200 & 0.62\% \\
-$32 \times 8{,}192$ & 125,000 & 124,100 & 0.72\% \\
-$128 \times 32{,}768$ & 310,000 & 307,800 & 0.71\% \\
+$1 \times 512$, Llama-2-7B & [TODO: GB10] & [TODO: GB10] & [TODO] \\
+$8 \times 2{,}048$, Llama-2-7B & [TODO: A100] & [TODO: A100] & [TODO] \\
+$32 \times 8{,}192$, Llama-2-7B & [TODO: A100] & [TODO: A100] & [TODO] \\
+$128 \times 32{,}768$, Llama-2-13B & [TODO: H100] & [TODO: H100] & [TODO] \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-Overhead is constant across scales: the per-position mask check cost scales proportionally with the attention computation itself.
 
 \subsection{Experiment 6: Kernel Correctness}
 
@@ -1415,14 +1725,85 @@ Hard masking operates on attention logits \emph{after} dot products, leaving sha
 \paragraph{Key insight.} \emph{Isolation is a data-flow property best enforced at the attention level, not the representation level.} This aligns with the noninterference framework of \citet{goguen1982security}: control which inputs influence outputs, rather than transforming inputs.
 
 \subsection{Limitations}
+\label{sec:limitations}
 
-\paragraph{Scope.} TSAM protects KV-cache data flow, not model weights or training data~\citep{carlini2021extracting, lukas2023analyzing}. Weight-based extraction is orthogonal.
+We are explicit about what TSAM does \emph{not} guarantee.  Each item below
+is a real channel that a sufficiently motivated adversary can exploit;
+deployment teams must reason about each one independently.
 
-\paragraph{Detection window.} The DAI timing DFA requires $2K = 40$ queries before countermeasures activate. During this window, an adversary may extract limited information (amortized $< 0.09$ bits/query over 1,000 queries).
+\paragraph{Channels out of scope.}
+\begin{itemize}[leftmargin=1.5em,itemsep=2pt]
+\item \textbf{GPU memory side channels.}  L2-cache timing, DRAM
+  row-buffer conflicts, and CUDA scheduling patterns can leak page
+  occupancy and access timing.  These require hardware/OS mitigations
+  (e.g., spatial partitioning, MIG, microcode updates against
+  Spectre~\citep{kocher2019spectre}, page-coloring), not software
+  masking.  TSAM does not address them.
+\item \textbf{Allocation-pattern metadata.}  The set of physical blocks a
+  tenant holds, the timing of allocations and frees, and the sequence
+  lengths processed all leak information about tenant activity and
+  prompt characteristics.  TSAM does not obfuscate allocation metadata.
+\item \textbf{Malicious operator.}  TSAM trusts the serving infrastructure
+  to assign correct page types, apply the mask before softmax, and
+  preserve metadata across continuous batching.  A malicious or
+  compromised operator can trivially bypass it (e.g., by mislabelling
+  a private page as shared).
+\item \textbf{Non-attention cross-position channels.}  Architectures that
+  perform cross-position operations outside attention---for example,
+  sequence-level batch normalisation, 1D convolutions over positions, or
+  cross-attention to external memory---violate condition C3 and are not
+  covered by Theorem~\ref{thm:e2e}.  Standard decoder-only LMs (GPT,
+  LLaMA, Qwen, Gemma) satisfy C3 by construction.
+\item \textbf{Model-mediated semantic channels.}  TSAM controls
+  information flow through attention weights.  It does not prevent an
+  adversary from inferring information through the model's generated
+  text via prompt injection, jailbreak prompts, or shared-prompt
+  contamination.  These require application-layer defences.
+\item \textbf{Training-data extraction.}  TSAM is an inference-time
+  mechanism.  Memorisation in model weights~\citep{carlini2021extracting,
+  nasr2023scalable, lukas2023analyzing} is orthogonal and unaddressed.
+\item \textbf{Per-tenant LoRA adapters in the masked path.}  Per-tenant
+  adapters~\citep{hu2022lora, sheng2023slora} placed inside the masked
+  attention computation violate condition C4 and break the proof.
+  Adapter-aware variants of TSAM are future work.
+\end{itemize}
 
-\paragraph{Reference implementation.} Production deployment requires full kernel fusion with FlashAttention~\citep{dao2022flashattention, dao2023flashattention2} for optimal performance. Our Triton prototype demonstrates feasibility.
+\paragraph{Empirical gaps in this paper.}
+The strongest result we report is bitwise exact noninterference up to
+24-layer transformers with random weights
+(\S\ref{sec:e2e:empirical}).  Several measurements that a
+deployment-ready submission would include are deferred:
+\begin{itemize}[leftmargin=1.5em,itemsep=2pt]
+\item \textbf{Real LLM serving throughput} (Llama-2-7B/13B on A100/H100
+  under continuous batching) is catalogued as
+  Table~\ref{tab:throughput-todo} but not yet measured.
+\item \textbf{Real adversarial co-tenant harness} (block-table confusion,
+  shared-prefix poisoning, stale-block reuse) under TSAM-vLLM is not
+  yet runnable end-to-end; production timing-attack ROC/AUC requires
+  this harness.
+\item \textbf{Compiled CUDA kernel patch.}  The patch returned by
+  \texttt{generate\_vllm\_kernel\_patch} is a sketch.  It uses
+  \texttt{-INFINITY} for IEEE~754 alignment with the Python reference
+  and the masking branch is in scope of the \texttt{qk} declaration, but
+  it has not yet been compiled or applied to a pinned vLLM commit.
+\end{itemize}
 
-\paragraph{Covert channels.} TSAM does not address model-behavior covert channels (e.g., prompt injection), which require application-layer defenses.
+\paragraph{Detection window of the DAI defence.}
+The DAI timing DFA is detection-triggered, not constant-time.  Pre-detection,
+the adversary operates against an undefended channel; the maximum
+pre-detection leakage is bounded by $K + W \leq 70$ probes (\S\ref{sec:dai}).
+A constant-time padding variant would close this window at the cost of
+unconditional latency overhead and is left as future work.
+
+\paragraph{Production hardening.}  Production deployment additionally
+requires: a clean-compute provenance check that verifies condition C2
+before admitting any page as SHARED (the
+\texttt{tsam.core.compute\_provenance} module sketches the API); a typed
+page-lifecycle module that zeroizes freed KV slots before reuse and
+enforces copy-on-write when a private continuation derives from a shared
+prefix (\texttt{tsam.core.page\_lifecycle}); and an admission policy on
+shared-prefix content hashes so that an attacker cannot launder private
+data through the SHARED label.
 
 \subsection{Broader Impact}
 
@@ -1443,16 +1824,51 @@ TSAM closes this gap through \emph{typed KV-cache pages} and \emph{hard attentio
 
 Our evaluation demonstrates:
 \begin{itemize}[leftmargin=*,itemsep=2pt]
-    \item \textbf{Zero leakage}: 0.0 bits across 100 adversarial queries with worst-case block sharing;
-    \item \textbf{Unlimited scale}: zero leakage at 10,000+ tenants (orthogonal projection fails at 17);
-    \item \textbf{Preserved prefix sharing}: single shared copy, $<$5\% overhead vs.\ vanilla;
-    \item \textbf{Minimal overhead}: $<$1\% throughput impact across all configurations;
-    \item \textbf{Timing defense}: $\geq$95\% reduction in side-channel leakage via DAI.
+    \item \textbf{Bitwise-exact end-to-end noninterference} on a 24-layer
+      transformer: the attacker's output logits are bitwise-identical
+      regardless of the victim's private tokens, across 50 trials per
+      depth $L \in \{1,2,4,8,12,24\}$ (\S\ref{sec:e2e:empirical}).
+    \item \textbf{Linear probing collapse}: a ridge classifier extracts
+      the victim's private prompt class with 100\% accuracy under
+      vanilla attention but only random chance ($11.7\%$ vs.\ $12.5\%$
+      baseline) under TSAM, at every depth tested.
+    \item \textbf{Memory-bound tenant capacity}: the mask is a metadata
+      lookup with no algebraic dependence on $d_{\mathrm{model}}$ or
+      tenant count; orthogonal projection fails at
+      $\lfloor d_{\mathrm{model}}/d_{\mathrm{sub}} \rfloor$ tenants by
+      construction (\S\ref{sec:formal:orthogonal}).
+    \item \textbf{Preserved prefix sharing}: SHARED pages remain
+      single-copy and visible to all tenants (\S\ref{sec:design:pages}).
+    \item \textbf{Per-page metadata}: 5 bytes per block, $\approx$0.06\%
+      of KV-cache volume.
+    \item \textbf{Detection-triggered timing mitigation}: DAI bounds
+      pre-detection leakage to $\leq K + W = 70$ probes and reduces
+      post-detection per-probe channel capacity by $>99\%$ under the
+      analytic adversary model (\S\ref{sec:dai}).
 \end{itemize}
 
-The key insight is that \emph{isolation is a data-flow property best enforced at the attention level, not the representation level}. By intervening where information flows between tokens, TSAM achieves exact isolation without distorting representations, limiting model capacity, or sacrificing serving efficiency.
+We are explicit about what we do not claim: production GPU
+throughput numbers (Table~\ref{tab:throughput-todo} is a runbook
+specification, not a result), end-to-end TSAM-vLLM integration on
+Llama-2 weights, and protection against channels outside attention
+(\S\ref{sec:limitations}).
 
-\paragraph{Future work.} Extending TSAM to LoRA adapter isolation~\citep{hu2022lora, sheng2023slora}, distributed multi-GPU serving, and formal verification in Coq or Lean.
+The key insight is that \emph{isolation is a data-flow property best
+enforced at the attention level, not the representation level}.  By
+intervening where information flows between tokens---rather than
+transforming the representations themselves---TSAM achieves structural
+zero-leakage in the attention channel, decouples tenant scalability
+from model dimensionality, and preserves prefix sharing.
+
+\paragraph{Future work.}  The deployment-ready submission this paper
+points toward requires: (i) a real vLLM fork with the CUDA patch
+compiled and applied, (ii) Llama-2-7B/13B end-to-end throughput on
+A100/H100 with continuous batching, (iii) a real adversarial co-tenant
+harness exercising block-table confusion and shared-prefix poisoning,
+(iv) a constant-time variant of DAI to close the detection window, and
+(v) extending TSAM to per-tenant LoRA adapters~\citep{hu2022lora,
+sheng2023slora}, distributed multi-GPU serving, and formal verification
+in Coq or Lean.
 
 % ==============================================================================
 

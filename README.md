@@ -1,8 +1,18 @@
 # TSAM: Tenant-Scoped Attention Masking for Multi-Tenant LLM Serving
 
-**Technical Report** -- Open-source reference implementation and deployment guide.
+Reference implementation and deployment guide. The companion paper draft
+(`paper/main.tex`) frames TSAM as a research contribution to information-flow
+control for shared LLM serving; this README is the engineering counterpart and
+keeps a deliberately practical tone.
 
-TSAM is a lightweight extension to [PagedAttention](https://arxiv.org/abs/2309.06180) that isolates tenants in shared LLM serving by masking cross-tenant KV-cache entries in the attention kernel. It is not a research breakthrough. It is a practical engineering solution to a real deployment problem.
+TSAM is a lightweight extension to [PagedAttention](https://arxiv.org/abs/2309.06180)
+that isolates tenants in shared LLM serving by masking cross-tenant KV-cache
+entries in the attention kernel. The novel piece is *not* the mask itself but
+the integration of page-level information-flow typing
+([Denning 1976](https://dl.acm.org/doi/10.1145/360051.360056),
+[Sabelfeld and Myers 2003](https://www.cs.cornell.edu/andru/papers/jsac/sm-jsac03.pdf))
+with PagedAttention's KV-cache abstraction, which decouples tenant scalability
+from model dimensionality while preserving prefix sharing.
 
 ## What It Does
 
@@ -235,6 +245,24 @@ python -c "from tsam.benchmarks.probing_attack import run_probing_attack; print(
 The core isolation mechanism is solid. The integration with production serving systems is not yet validated. Contributions welcome.
 
 ---
+
+## Paper
+
+A NeurIPS-style draft is in [`paper/main.tex`](paper/main.tex). Build with
+`cd paper && make pdf` (requires `latexmk` or `pdflatex` + `bibtex`).
+
+The draft elevates the engineering framing of this README to a research
+contribution: page-typed information-flow control for PagedAttention, with a
+formal **Attention-Channel Noninterference under Correct Page Typing** theorem
+(Theorem 1) and an end-to-end extension under explicit conditions C1–C4
+(Theorem 2). The C1–C4 conditions in the paper are the same deployment
+checklist as in this README, lifted into the paper's
+**Definition: TSAM-Compliant Transformer**.
+
+The paper is explicit about empirical gaps: production GPU throughput numbers
+on Llama-2 with vLLM continuous batching, a real adversarial co-tenant attack
+harness, and a compiled CUDA patch are all catalogued as deferred work in
+`paper/main.tex` §Limitations and the runbook below.
 
 ## License
 
